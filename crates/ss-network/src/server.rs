@@ -1,5 +1,6 @@
 use crate::framing::{read_frame, write_frame};
 use crate::tls;
+use crate::ServerEvent;
 use ss_core::protocol::{
     Message, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS,
 };
@@ -24,6 +25,8 @@ pub struct ServerState {
     pub clients: RwLock<HashMap<String, ConnectedClient>>,
     /// Broadcast channel for messages received from any client
     pub broadcast_rx: broadcast::Sender<(String, Message)>,
+    /// Notification channel for client connect/disconnect events
+    pub notify_tx: broadcast::Sender<ServerEvent>,
     /// Screen width of the server
     pub screen_width: u32,
     /// Screen height of the server
@@ -33,9 +36,11 @@ pub struct ServerState {
 impl ServerState {
     pub fn new(screen_width: u32, screen_height: u32) -> Self {
         let (broadcast_tx, _) = broadcast::channel(256);
+        let (notify_tx, _) = broadcast::channel(64);
         Self {
             clients: RwLock::new(HashMap::new()),
             broadcast_rx: broadcast_tx,
+            notify_tx,
             screen_width,
             screen_height,
         }
@@ -222,6 +227,11 @@ async fn handle_control_connection(
 
     tracing::info!("Client {client_name} fully connected");
 
+    // Notify that a client has connected
+    let _ = state.notify_tx.send(ServerEvent::ClientConnected {
+        name: client_name.clone(),
+    });
+
     // Split the TLS stream for concurrent read/write
     let (mut reader, mut writer) = tokio::io::split(tls_stream);
 
@@ -277,6 +287,11 @@ async fn handle_control_connection(
     // Cleanup
     state.clients.write().await.remove(&client_name);
     tracing::info!("Client {client_name} removed");
+
+    // Notify that a client has disconnected
+    let _ = state.notify_tx.send(ServerEvent::ClientDisconnected {
+        name: client_name,
+    });
 
     Ok(())
 }

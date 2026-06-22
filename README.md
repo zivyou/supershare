@@ -69,45 +69,39 @@ On any machine, generate a CA and device certificates:
 
 ```bash
 # Generate CA certificate
-supershare gen-cert --output ./certs
+supershare --gen-cert --output ./certs
 
 # Generate device certificates (run for each machine)
-supershare gen-cert --device machine1 --output ./certs
-supershare gen-cert --device machine2 --output ./certs
+supershare --gen-cert --device machine1 --output ./certs
+supershare --gen-cert --device machine2 --output ./certs
 ```
 
 Distribute the certificates to each machine:
 - Each machine needs: `ca.pem`, its own `<name>.pem`, and `<name>-key.pem`
 
-#### 2. Start Server
+#### 2. Launch SuperShare
 
-On the main machine (the one with the keyboard and mouse):
+Simply run `supershare` to open the GUI:
 
 ```bash
-supershare server \
-  --port 9876 \
-  --cert certs/machine1.pem \
-  --key certs/machine1-key.pem \
-  --ca certs/ca.pem
+supershare
 ```
 
-#### 3. Start Client
+The GUI provides:
+- **Server tab**: Configure and start/stop the server, see connected clients in real-time
+- **Client tab**: Configure and connect/disconnect to a server
+- **Clipboard tab**: Configure clipboard sync settings
 
-On the secondary machine:
+#### 3. Headless Mode (Optional)
 
-```bash
-supershare client \
-  --server 192.168.1.100:9876 \
-  --cert certs/machine2.pem \
-  --key certs/machine2-key.pem \
-  --ca certs/ca.pem \
-  --name machine2
-```
-
-#### 4. Open GUI (Optional)
+For servers or scripted environments, use headless mode:
 
 ```bash
-supershare gui
+# Headless server
+supershare --server --port 9876 --cert certs/server.pem --key certs/server-key.pem --ca certs/ca.pem
+
+# Headless client
+supershare --client --connect 192.168.1.100:9876 --cert certs/client.pem --key certs/client-key.pem --ca certs/ca.pem --name my-pc
 ```
 
 ### Usage
@@ -155,7 +149,7 @@ supershare/
 │   ├── ss-input/           # Input capture & injection (rdev)
 │   ├── ss-clipboard/       # Clipboard monitoring & sync
 │   ├── ss-network/         # TLS networking (tokio + rustls)
-│   └── ss-ui/              # egui configuration UI + system tray
+│   └── ss-ui/              # egui configuration UI
 └── assets/
     ├── supershare.exe.manifest  # Windows UAC manifest
     └── 99-superShare.rules      # Linux udev rules
@@ -265,45 +259,39 @@ cargo build --release
 
 ```bash
 # 生成 CA 证书
-supershare gen-cert --output ./certs
+supershare --gen-cert --output ./certs
 
 # 为每台机器生成设备证书
-supershare gen-cert --device machine1 --output ./certs
-supershare gen-cert --device machine2 --output ./certs
+supershare --gen-cert --device machine1 --output ./certs
+supershare --gen-cert --device machine2 --output ./certs
 ```
 
 将证书分发到各台机器：
 - 每台机器需要：`ca.pem`、自己的 `<name>.pem` 和 `<name>-key.pem`
 
-#### 2. 启动服务端
+#### 2. 启动 SuperShare
 
-在主控机器（连接键盘鼠标的机器）上：
+直接运行 `supershare` 打开图形界面：
 
 ```bash
-supershare server \
-  --port 9876 \
-  --cert certs/machine1.pem \
-  --key certs/machine1-key.pem \
-  --ca certs/ca.pem
+supershare
 ```
 
-#### 3. 启动客户端
+图形界面提供：
+- **Server 标签页**: 配置并启动/停止服务端，实时查看已连接客户端
+- **Client 标签页**: 配置并连接/断开服务端
+- **Clipboard 标签页**: 配置剪切板同步设置
 
-在被控机器上：
+#### 3. 无头模式（可选）
 
-```bash
-supershare client \
-  --server 192.168.1.100:9876 \
-  --cert certs/machine2.pem \
-  --key certs/machine2-key.pem \
-  --ca certs/ca.pem \
-  --name machine2
-```
-
-#### 4. 打开配置界面（可选）
+在服务器或脚本环境中使用无头模式：
 
 ```bash
-supershare gui
+# 无头服务端
+supershare --server --port 9876 --cert certs/server.pem --key certs/server-key.pem --ca certs/ca.pem
+
+# 无头客户端
+supershare --client --connect 192.168.1.100:9876 --cert certs/client.pem --key certs/client-key.pem --ca certs/ca.pem --name my-pc
 ```
 
 ### 使用方法
@@ -349,7 +337,7 @@ supershare/
 │   ├── ss-input/           # 输入捕获与注入 (rdev)
 │   ├── ss-clipboard/       # 剪切板监控与同步
 │   ├── ss-network/         # TLS 网络通信 (tokio + rustls)
-│   └── ss-ui/              # egui 配置界面 + 系统托盘
+│   └── ss-ui/              # egui 配置界面
 └── assets/
     ├── supershare.exe.manifest  # Windows UAC 清单
     └── 99-superShare.rules      # Linux udev 规则

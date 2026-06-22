@@ -1,84 +1,62 @@
 mod certgen;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use ss_core::config::AppConfig;
+use ss_network::ServerEvent;
+use ss_ui::state::{AppCommand, ClientInfo, SharedAppState, SharedState};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::sync::{Arc, RwLock};
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Parser)]
 #[command(name = "supershare", version, about = "Cross-machine keyboard, mouse and clipboard sharing")]
 struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+    /// Run in headless server mode
+    #[arg(long)]
+    server: bool,
+
+    /// Run in headless client mode
+    #[arg(long)]
+    client: bool,
+
+    /// Listen port (server mode)
+    #[arg(long, default_value = "9876")]
+    port: u16,
+
+    /// Server address to connect to (client mode)
+    #[arg(long)]
+    connect: Option<String>,
+
+    /// TLS certificate file path
+    #[arg(long)]
+    cert: Option<PathBuf>,
+
+    /// TLS private key file path
+    #[arg(long)]
+    key: Option<PathBuf>,
+
+    /// CA certificate file path
+    #[arg(long)]
+    ca: Option<PathBuf>,
+
+    /// Device name (client mode)
+    #[arg(long, default_value = "")]
+    name: String,
+
+    /// Generate certificates
+    #[arg(long)]
+    gen_cert: bool,
+
+    /// Output directory for generated certificates
+    #[arg(long, default_value = "./certs")]
+    output: PathBuf,
+
+    /// Generate device certificate with this name
+    #[arg(long)]
+    device: Option<String>,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Start in server mode
-    Server {
-        /// Listen port for control channel
-        #[arg(long, default_value = "9876")]
-        port: u16,
-
-        /// TLS certificate file path
-        #[arg(long)]
-        cert: PathBuf,
-
-        /// TLS private key file path
-        #[arg(long)]
-        key: PathBuf,
-
-        /// CA certificate file path for mTLS
-        #[arg(long)]
-        ca: PathBuf,
-    },
-    /// Start in client mode
-    Client {
-        /// Server address (host:port)
-        #[arg(long)]
-        server: String,
-
-        /// TLS certificate file path
-        #[arg(long)]
-        cert: PathBuf,
-
-        /// TLS private key file path
-        #[arg(long)]
-        key: PathBuf,
-
-        /// CA certificate file path
-        #[arg(long)]
-        ca: PathBuf,
-
-        /// Device name
-        #[arg(long, default_value = "")]
-        name: String,
-    },
-    /// Open the configuration GUI
-    Gui,
-    /// Generate TLS certificates
-    GenCert {
-        /// Output directory for generated certificates
-        #[arg(long, default_value = "./certs")]
-        output: PathBuf,
-
-        /// Generate device certificate (requires --ca-cert and --ca-key)
-        #[arg(long)]
-        device: Option<String>,
-
-        /// CA certificate path (for signing device certs)
-        #[arg(long)]
-        ca_cert: Option<PathBuf>,
-
-        /// CA key path (for signing device certs)
-        #[arg(long)]
-        ca_key: Option<PathBuf>,
-    },
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -88,274 +66,313 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Server {
-            port,
-            cert,
-            key,
-            ca,
-        } => {
-            run_server(port, cert, key, ca).await?;
-        }
-        Commands::Client {
-            server,
-            cert,
-            key,
-            ca,
-            name,
-        } => {
-            run_client(server, cert, key, ca, name).await?;
-        }
-        Commands::Gui => {
-            run_gui()?;
-        }
-        Commands::GenCert {
-            output,
-            device,
-            ca_cert,
-            ca_key,
-        } => {
-            run_gen_cert(output, device, ca_cert, ca_key)?;
+    // Certificate generation mode (no async needed)
+    if cli.gen_cert {
+        return run_gen_cert(cli.output, cli.device);
+    }
+
+    // Headless server mode
+    if cli.server {
+        let cert = cli.cert.ok_or_else(|| anyhow::anyhow!("--cert is required"))?;
+        let key = cli.key.ok_or_else(|| anyhow::anyhow!("--key is required"))?;
+        let ca = cli.ca.ok_or_else(|| anyhow::anyhow!("--ca is required"))?;
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(run_headless_server(cli.port, cert, key, ca));
+    }
+
+    // Headless client mode
+    if cli.client {
+        let server = cli.connect.ok_or_else(|| anyhow::anyhow!("--connect is required"))?;
+        let cert = cli.cert.ok_or_else(|| anyhow::anyhow!("--cert is required"))?;
+        let key = cli.key.ok_or_else(|| anyhow::anyhow!("--key is required"))?;
+        let ca = cli.ca.ok_or_else(|| anyhow::anyhow!("--ca is required"))?;
+        let name = if cli.name.is_empty() {
+            hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        } else {
+            cli.name
+        };
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(run_headless_client(server, cert, key, ca, name));
+    }
+
+    // Default: GUI mode — tokio runtime on background thread, GUI on main thread
+    run_gui_mode()
+}
+
+/// Run the GUI with integrated runtime.
+/// Tokio runtime runs on a background thread; GUI runs on the main thread.
+fn run_gui_mode() -> anyhow::Result<()> {
+    let config = AppConfig::load();
+
+    let shared_state: SharedState = Arc::new(RwLock::new(SharedAppState::default()));
+    let (cmd_tx, cmd_rx) = mpsc::channel::<AppCommand>(16);
+
+    // Spawn a dedicated thread for the tokio runtime
+    let state_for_rt = shared_state.clone();
+    let _rt_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async move {
+            command_handler(cmd_rx, state_for_rt).await;
+        });
+    });
+
+    // Run the GUI on the main thread (blocks until window is closed)
+    let result = ss_ui::app::run_gui(config, shared_state, cmd_tx);
+
+    // GUI exited — the runtime thread will also exit when cmd_tx is dropped
+    // (cmd_rx will get a RecvError and the handler loop will end)
+    result
+}
+
+/// Command handler: receives AppCommand and manages server/client lifecycle
+async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedState) {
+    let mut server_shutdown: Option<broadcast::Sender<()>> = None;
+    let mut client_shutdown: Option<broadcast::Sender<()>> = None;
+
+    while let Some(cmd) = cmd_rx.recv().await {
+        tracing::info!("Command handler received command: {:?}", cmd);
+        match cmd {
+            AppCommand::StartServer {
+                control_port,
+                data_port,
+                cert_path,
+                key_path,
+                ca_path,
+            } => {
+                tracing::info!("Starting server on port {control_port}");
+
+                let server_state = Arc::new(ss_network::server::ServerState::new(1920, 1080));
+
+                // Listen for server events
+                let mut notify_rx = server_state.notify_tx.subscribe();
+                let state_for_events = state.clone();
+                tokio::spawn(async move {
+                    while let Ok(event) = notify_rx.recv().await {
+                        let mut s = state_for_events.write().unwrap();
+                        match event {
+                            ServerEvent::ClientConnected { name } => {
+                                tracing::info!("Client connected: {name}");
+                                s.connected_clients.push(ClientInfo {
+                                    name,
+                                    connected_at: std::time::Instant::now(),
+                                });
+                            }
+                            ServerEvent::ClientDisconnected { name } => {
+                                tracing::info!("Client disconnected: {name}");
+                                s.connected_clients.retain(|c| c.name != name);
+                            }
+                        }
+                    }
+                });
+
+                let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+                server_shutdown = Some(shutdown_tx);
+
+                let config = ss_network::server::ServerConfig {
+                    control_port,
+                    data_port,
+                    cert_path,
+                    key_path,
+                    ca_path,
+                };
+
+                let state_clone = state.clone();
+                let server_state_clone = server_state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = ss_network::server::start(config, server_state_clone, shutdown_rx).await {
+                        tracing::error!("Server error: {e}");
+                        let mut s = state_clone.write().unwrap();
+                        s.last_error = Some(format!("Server error: {e}"));
+                        s.server_running = false;
+                        s.server_port = None;
+                    }
+                });
+
+                // Update state
+                {
+                    let mut s = state.write().unwrap();
+                    s.server_running = true;
+                    s.server_port = Some(control_port);
+                    s.last_error = None;
+                }
+            }
+            AppCommand::StopServer => {
+                tracing::info!("Stopping server");
+                if let Some(tx) = server_shutdown.take() {
+                    let _ = tx.send(());
+                }
+                let mut s = state.write().unwrap();
+                s.server_running = false;
+                s.server_port = None;
+                s.connected_clients.clear();
+            }
+            AppCommand::ConnectClient {
+                server_address,
+                cert_path,
+                key_path,
+                ca_path,
+                device_name,
+            } => {
+                tracing::info!("Connecting to {server_address}");
+
+                let config = ss_network::client::ClientConfig {
+                    server_address: server_address.clone(),
+                    cert_path,
+                    key_path,
+                    ca_path,
+                    device_name,
+                };
+
+                let state_clone = state.clone();
+                let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+                client_shutdown = Some(shutdown_tx);
+
+                tokio::spawn(async move {
+                    match ss_network::client::connect_with_retry(config).await {
+                        Ok(mut conn) => {
+                            // Update state on successful connection
+                            {
+                                let mut s = state_clone.write().unwrap();
+                                s.client_connected = true;
+                                s.client_server_addr = Some(server_address.clone());
+                                s.server_screen_size = conn.server_screen;
+                                s.last_error = None;
+                            }
+
+                            // Keep connection alive, listen for disconnect
+                            loop {
+                                tokio::select! {
+                                    msg = conn.control_rx.recv() => {
+                                        match msg {
+                                            Ok(ss_core::protocol::Message::Heartbeat) => {}
+                                            Ok(_) => {}
+                                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                            Err(broadcast::error::RecvError::Closed) => {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Connection closed
+                            let mut s = state_clone.write().unwrap();
+                            s.client_connected = false;
+                            s.client_server_addr = None;
+                            s.server_screen_size = None;
+                        }
+                        Err(e) => {
+                            tracing::error!("Client connection error: {e}");
+                            let mut s = state_clone.write().unwrap();
+                            s.client_connected = false;
+                            s.last_error = Some(format!("Connection failed: {e}"));
+                        }
+                    }
+                });
+
+                // Update state optimistically
+                {
+                    let mut s = state.write().unwrap();
+                    s.last_error = None;
+                }
+            }
+            AppCommand::DisconnectClient => {
+                tracing::info!("Disconnecting client");
+                if let Some(tx) = client_shutdown.take() {
+                    let _ = tx.send(());
+                }
+                let mut s = state.write().unwrap();
+                s.client_connected = false;
+                s.client_server_addr = None;
+                s.server_screen_size = None;
+            }
         }
     }
 
-    Ok(())
+    tracing::info!("Command handler exiting");
 }
 
-/// Run the server
-async fn run_server(
+/// Run headless server (CLI mode)
+async fn run_headless_server(
     port: u16,
     cert: PathBuf,
     key: PathBuf,
     ca: PathBuf,
 ) -> anyhow::Result<()> {
-    let config = AppConfig::load();
-    let data_port = port + 1;
+    tracing::info!("Starting headless server on port {port}");
 
-    tracing::info!("Starting SuperShare server");
-    tracing::info!("  Control port: {port}");
-    tracing::info!("  Data port: {data_port}");
+    let server_state = Arc::new(ss_network::server::ServerState::new(1920, 1080));
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-    let state = Arc::new(ss_network::server::ServerState::new(1920, 1080)); // TODO: detect actual screen size
+    // Log client events
+    let mut notify_rx = server_state.notify_tx.subscribe();
+    tokio::spawn(async move {
+        while let Ok(event) = notify_rx.recv().await {
+            match event {
+                ServerEvent::ClientConnected { name } => tracing::info!("Client connected: {name}"),
+                ServerEvent::ClientDisconnected { name } => tracing::info!("Client disconnected: {name}"),
+            }
+        }
+    });
 
-    let server_config = ss_network::server::ServerConfig {
+    let config = ss_network::server::ServerConfig {
         control_port: port,
-        data_port,
+        data_port: port + 1,
         cert_path: cert,
         key_path: key,
         ca_path: ca,
     };
 
-    let (shutdown_tx, _) = broadcast::channel(1);
-
     // Handle Ctrl+C
-    let shutdown_signal = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("Shutdown signal received");
-        let _ = shutdown_signal.send(());
+        let _ = shutdown_tx.send(());
     });
 
-    // Start input capture
-    let suppressed = Arc::new(std::sync::Mutex::new(false));
-    let mut input_rx = ss_input::capture::start_capture(suppressed.clone());
-
-    // Start clipboard monitor
-    let clipboard_monitor = ss_clipboard::monitor::ClipboardMonitor::new();
-    let (mut clipboard_rx, _suppress_tx) = ss_clipboard::monitor::start_monitor(clipboard_monitor);
-
-    let state_input = state.clone();
-    let state_clipboard = state.clone();
-
-    // Spawn input event forwarder
-    tokio::spawn(async move {
-        while let Some(event) = input_rx.recv().await {
-            let msg = ss_input::capture::to_message(&event);
-            // TODO: boundary detection and routing
-            ss_network::server::broadcast_control(&state_input, &msg).await;
-        }
-    });
-
-    // Spawn clipboard event forwarder
-    tokio::spawn(async move {
-        while let Some(change) = clipboard_rx.recv().await {
-            tracing::info!("Clipboard changed, syncing...");
-            match ss_clipboard::sync::prepare_transfer(&change.content) {
-                Ok(messages) => {
-                    for msg in messages {
-                        ss_network::server::broadcast_data(&state_clipboard, &msg).await;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to prepare clipboard transfer: {e}");
-                }
-            }
-        }
-    });
-
-    // Run the server
-    ss_network::server::start(server_config, state, shutdown_tx.subscribe()).await?;
-
-    Ok(())
+    ss_network::server::start(config, server_state, shutdown_rx).await
 }
 
-/// Run the client
-async fn run_client(
+/// Run headless client (CLI mode)
+async fn run_headless_client(
     server: String,
     cert: PathBuf,
     key: PathBuf,
     ca: PathBuf,
     name: String,
 ) -> anyhow::Result<()> {
-    let device_name = if name.is_empty() {
-        hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "unknown".to_string())
-    } else {
-        name
-    };
+    tracing::info!("Connecting to {server} as {name}");
 
-    tracing::info!("Starting SuperShare client");
-    tracing::info!("  Server: {server}");
-    tracing::info!("  Device: {device_name}");
-
-    let client_config = ss_network::client::ClientConfig {
+    let config = ss_network::client::ClientConfig {
         server_address: server,
         cert_path: cert,
         key_path: key,
         ca_path: ca,
-        device_name,
+        device_name: name,
     };
 
-    let mut conn = ss_network::client::connect_with_retry(client_config).await?;
+    let _conn = ss_network::client::connect_with_retry(config).await?;
+    tracing::info!("Connected. Press Ctrl+C to disconnect.");
 
-    tracing::info!("Connected to server");
-    if let Some((w, h)) = conn.server_screen {
-        tracing::info!("  Server screen: {w}x{h}");
-    }
-
-    // Start clipboard monitor
-    let clipboard_monitor = ss_clipboard::monitor::ClipboardMonitor::new();
-    let (mut clipboard_rx, _suppress_tx) = ss_clipboard::monitor::start_monitor(clipboard_monitor);
-
-    let data_tx = conn.data_tx.clone();
-
-    // Spawn clipboard sync task
-    tokio::spawn(async move {
-        while let Some(change) = clipboard_rx.recv().await {
-            tracing::info!("Clipboard changed, sending to server...");
-            match ss_clipboard::sync::prepare_transfer(&change.content) {
-                Ok(messages) => {
-                    for msg in messages {
-                        let _ = data_tx.send(msg).await;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to prepare clipboard transfer: {e}");
-                }
-            }
-        }
-    });
-
-    // Process incoming control messages (input events to inject)
-    let suppressed = Arc::new(std::sync::Mutex::new(false));
-    let suppressed_clone = suppressed.clone();
-
-    tokio::spawn(async move {
-        loop {
-            match conn.control_rx.recv().await {
-                Ok(msg) => {
-                    match &msg {
-                        ss_core::protocol::Message::BoundaryEnter { .. } => {
-                            *suppressed_clone.lock().unwrap() = true;
-                        }
-                        ss_core::protocol::Message::BoundaryLeave { .. } => {
-                            *suppressed_clone.lock().unwrap() = false;
-                        }
-                        _ => {
-                            // Inject input event
-                            ss_input::inject::inject_event(&msg);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Control channel error: {e}");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Process incoming data messages (clipboard data)
-    tokio::spawn(async move {
-        let mut reassembler = None;
-        loop {
-            match conn.data_rx.recv().await {
-                Ok(msg) => {
-                    if let Some(content) =
-                        ss_clipboard::sync::handle_clipboard_message(&msg, &mut reassembler)
-                    {
-                        tracing::info!("Received clipboard content from server");
-                        match content {
-                            ss_core::protocol::ClipboardContent::Text(text) => {
-                                if let Err(e) = ss_clipboard::monitor::write_clipboard_text(&text) {
-                                    tracing::error!("Failed to write clipboard text: {e}");
-                                }
-                            }
-                            ss_core::protocol::ClipboardContent::Image {
-                                width,
-                                height,
-                                rgba,
-                            } => {
-                                if let Err(e) =
-                                    ss_clipboard::monitor::write_clipboard_image(width, height, &rgba)
-                                {
-                                    tracing::error!("Failed to write clipboard image: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Data channel error: {e}");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Wait for shutdown
     tokio::signal::ctrl_c().await.ok();
-    tracing::info!("Client shutting down");
-
+    tracing::info!("Disconnecting");
     Ok(())
 }
 
-/// Run the GUI
-fn run_gui() -> anyhow::Result<()> {
-    let _config = AppConfig::load();
-    ss_ui::app::run_gui(_config)
-}
-
-/// Run certificate generation
-fn run_gen_cert(
-    output: PathBuf,
-    device: Option<String>,
-    _ca_cert: Option<PathBuf>,
-    _ca_key: Option<PathBuf>,
-) -> anyhow::Result<()> {
+/// Generate certificates
+fn run_gen_cert(output: PathBuf, device: Option<String>) -> anyhow::Result<()> {
     match device {
         Some(device_name) => {
-            // Generate self-signed device cert
             certgen::generate_device_cert(&output, &device_name)?;
             println!("Device certificate for '{}' generated in {}", device_name, output.display());
         }
         None => {
-            // Generate CA cert
             certgen::generate_ca(&output)?;
             println!("CA certificate and key generated in {}", output.display());
             println!("Next steps:");
-            println!("  1. Generate device certs: supershare gen-cert --device <name>");
+            println!("  1. Generate device certs: supershare --gen-cert --device <name>");
         }
     }
     Ok(())

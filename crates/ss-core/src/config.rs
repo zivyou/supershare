@@ -31,6 +31,9 @@ pub struct ServerConfig {
     /// TLS private key file path
     pub key_path: Option<PathBuf>,
 
+    /// CA certificate file path
+    pub ca_path: Option<PathBuf>,
+
     /// Connected clients (name, IP, screen position)
     #[serde(default)]
     pub clients: Vec<ClientEntry>,
@@ -118,6 +121,7 @@ impl Default for ServerConfig {
             data_port: default_data_port(),
             cert_path: None,
             key_path: None,
+            ca_path: None,
             clients: Vec::new(),
         }
     }
