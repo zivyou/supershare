@@ -1,0 +1,14 @@
+[package]
+name = "ss-clipboard"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ss-core = { path = "../ss-core" }
+arboard.workspace = true
+blake3.workspace = true
+zstd.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }

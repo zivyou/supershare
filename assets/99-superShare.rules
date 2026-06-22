@@ -1,0 +1,16 @@
+# SuperShare udev rules
+# Allows members of the "input" group to access input devices
+# without requiring root privileges.
+#
+# Installation:
+#   sudo cp 99-superShare.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#   sudo usermod -aG input $USER
+#   # Log out and back in for group changes to take effect
+
+# Allow group "input" to read/write uinput device
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+
+# Allow group "input" to read event devices
+SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"

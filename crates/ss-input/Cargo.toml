@@ -1,0 +1,15 @@
+[package]
+name = "ss-input"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ss-core = { path = "../ss-core" }
+rdev.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.12"

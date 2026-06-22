@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock file (for libraries, keep for binaries)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated certificates
+/certs/
+
+# Configuration (may contain paths)
+*.toml.bak
+
+# Windows build artifacts
+*.exe
+*.pdb
+*.dll
+*.lib
+
+# Linux build artifacts
+*.so
+*.o
+*.a
