@@ -113,10 +113,19 @@ pub async fn connect(config: ClientConfig) -> anyhow::Result<ClientConnection> {
         }
     });
 
-    // Connect data channel
-    tracing::info!("Connecting data channel to {}", config.server_address);
-    let data_stream = TcpStream::connect(&config.server_address).await?;
-    let data_name = tls::parse_server_name(&config.server_address)?;
+    // Connect data channel (port = control port + 1)
+    let data_address = {
+        let parts: Vec<&str> = config.server_address.split(':').collect();
+        if parts.len() == 2 {
+            let port: u16 = parts[1].parse().unwrap_or(9876);
+            format!("{}:{}", parts[0], port + 1)
+        } else {
+            format!("{}:9877", config.server_address)
+        }
+    };
+    tracing::info!("Connecting data channel to {}", data_address);
+    let data_stream = TcpStream::connect(&data_address).await?;
+    let data_name = tls::parse_server_name(&data_address)?;
     let mut data_tls = connector.connect(data_name, data_stream).await?;
 
     // Send handshake on data channel
