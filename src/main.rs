@@ -2,10 +2,11 @@ mod certgen;
 
 use clap::Parser;
 use ss_core::config::AppConfig;
+use ss_core::protocol::Message;
 use ss_network::ServerEvent;
 use ss_ui::state::{AppCommand, ClientInfo, SharedAppState, SharedState};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Parser)]
@@ -179,6 +180,187 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                     }
                 });
 
+                // --- Server-side sharing: input capture + boundary + clipboard ---
+
+                // Start input capture (not suppressed — server has control initially)
+                let suppressed = Arc::new(Mutex::new(false));
+                let suppressed_clone = suppressed.clone();
+                let mut input_rx = ss_input::capture::start_capture(suppressed_clone);
+
+                // Coordinate system for boundary detection
+                let coord = Arc::new(Mutex::new(ss_input::boundary::CoordinateSystem::new(1920, 1080)));
+
+                // Track which screen the cursor is on (0 = server, 1+ = client)
+                let active_screen: Arc<Mutex<u8>> = Arc::new(Mutex::new(0));
+
+                // Start clipboard monitor
+                let monitor = ss_clipboard::monitor::ClipboardMonitor::new();
+                let (mut clip_change_rx, clip_suppress_tx) = ss_clipboard::monitor::start_monitor(monitor);
+
+                // Task: forward input events to connected clients (boundary-aware)
+                let server_state_input = server_state.clone();
+                let active_screen_input = active_screen.clone();
+                let coord_input = coord.clone();
+                let suppressed_input = suppressed.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = input_rx.recv().await {
+                        let screen = *active_screen_input.lock().unwrap();
+
+                        // Only forward if cursor is on a client screen (screen > 0)
+                        if screen > 0 {
+                            let msg = ss_input::capture::to_message(&event);
+                            // Forward to all clients
+                            let clients = server_state_input.clients.read().await;
+                            for (name, client) in clients.iter() {
+                                if let Err(e) = client.data_tx.send(msg.clone()).await {
+                                    tracing::warn!("Failed to send input to {name}: {e}");
+                                }
+                            }
+                        }
+
+                        // Check boundary on mouse moves
+                        if let ss_input::capture::InputEvent::MouseMove { x, y } = event {
+                            let current_screen = *active_screen_input.lock().unwrap();
+                            // Check boundary without holding lock across await
+                            let boundary_result = {
+                                let coord = coord_input.lock().unwrap();
+                                coord.check_boundary(current_screen, x as f32, y as f32)
+                            };
+                            if let Some((target, enter_x, enter_y)) = boundary_result {
+                                if target != current_screen {
+                                    tracing::info!("Boundary crossed: screen {current_screen} -> {target}");
+                                    *active_screen_input.lock().unwrap() = target;
+
+                                    if target == 0 {
+                                        // Returning to server: unsuppress capture, send BoundaryLeave
+                                        *suppressed_input.lock().unwrap() = false;
+                                        let clients = server_state_input.clients.read().await;
+                                        for (_, client) in clients.iter() {
+                                            let _ = client.control_tx.send(Message::BoundaryLeave { source_screen: current_screen }).await;
+                                        }
+                                    } else {
+                                        // Moving to client: suppress local capture, send BoundaryEnter
+                                        *suppressed_input.lock().unwrap() = true;
+                                        let clients = server_state_input.clients.read().await;
+                                        for (_, client) in clients.iter() {
+                                            let _ = client.control_tx.send(Message::BoundaryEnter {
+                                                target_screen: target,
+                                                enter_x,
+                                                enter_y,
+                                            }).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // Task: receive messages from clients (via broadcast channel)
+                let mut broadcast_rx = server_state.broadcast_rx.subscribe();
+                let clip_suppress_server = clip_suppress_tx.clone();
+                let active_screen_recv = active_screen.clone();
+                let suppressed_recv = suppressed.clone();
+                tokio::spawn(async move {
+                    let mut reassembler: Option<ss_clipboard::sync::ClipboardReassembler> = None;
+                    loop {
+                        match broadcast_rx.recv().await {
+                            Ok((client_name, msg)) => {
+                                match &msg {
+                                    // Input events from client: inject locally (when cursor is on server)
+                                    Message::MouseMove { .. }
+                                    | Message::MouseButton { .. }
+                                    | Message::MouseScroll { .. }
+                                    | Message::KeyPress { .. } => {
+                                        let screen = *active_screen_recv.lock().unwrap();
+                                        if screen == 0 {
+                                            // Cursor on server, inject client input locally
+                                            ss_input::inject::inject_event(&msg);
+                                        }
+                                    }
+                                    // Boundary events from client
+                                    Message::BoundaryLeave { source_screen: _ } => {
+                                        tracing::info!("Client {client_name} returned control to server");
+                                        *active_screen_recv.lock().unwrap() = 0;
+                                        *suppressed_recv.lock().unwrap() = false;
+                                    }
+                                    // Clipboard messages from client
+                                    Message::ClipboardData { .. }
+                                    | Message::ClipboardBegin { .. }
+                                    | Message::ClipboardChunk { .. }
+                                    | Message::ClipboardEnd { .. } => {
+                                        if let Some(content) = ss_clipboard::sync::handle_clipboard_message(&msg, &mut reassembler) {
+                                            let hash = content.hash();
+                                            let write_result = match &content {
+                                                ss_core::protocol::ClipboardContent::Text(text) => {
+                                                    ss_clipboard::monitor::write_clipboard_text(text)
+                                                }
+                                                ss_core::protocol::ClipboardContent::Image { width, height, rgba } => {
+                                                    ss_clipboard::monitor::write_clipboard_image(*width, *height, rgba)
+                                                }
+                                            };
+                                            if let Err(e) = write_result {
+                                                tracing::error!("Failed to write clipboard from {client_name}: {e}");
+                                            } else {
+                                                let _ = clip_suppress_server.send(hash).await;
+                                                tracing::info!("Clipboard received from {client_name}");
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+
+                // Task: forward clipboard changes to all clients
+                let server_state_clip = server_state.clone();
+                tokio::spawn(async move {
+                    while let Some(change) = clip_change_rx.recv().await {
+                        match ss_clipboard::sync::prepare_transfer(&change.content) {
+                            Ok(messages) => {
+                                let clients = server_state_clip.clients.read().await;
+                                for (name, client) in clients.iter() {
+                                    for msg in &messages {
+                                        if let Err(e) = client.data_tx.send(msg.clone()).await {
+                                            tracing::warn!("Failed to send clipboard to {name}: {e}");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to prepare clipboard transfer: {e}");
+                            }
+                        }
+                    }
+                });
+
+                // Task: when a new client connects, add its screen to coordinate system
+                let mut notify_rx_coord = server_state.notify_tx.subscribe();
+                let coord_for_clients = coord.clone();
+                tokio::spawn(async move {
+                    let mut next_screen_id = 1u8;
+                    while let Ok(event) = notify_rx_coord.recv().await {
+                        match event {
+                            ServerEvent::ClientConnected { name } => {
+                                let mut c = coord_for_clients.lock().unwrap();
+                                // Add client screen to the right (default 1920x1080 for now)
+                                c.add_screen(next_screen_id, name.clone(), 1920, 1080);
+                                tracing::info!("Added screen {next_screen_id} for {name}, total width: {}", c.total_width());
+                                next_screen_id += 1;
+                            }
+                            ServerEvent::ClientDisconnected { name } => {
+                                // Note: we don't remove screens on disconnect to keep IDs stable
+                                tracing::info!("Client {name} disconnected (screen kept in layout)");
+                            }
+                        }
+                    }
+                });
+
                 let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
                 server_shutdown = Some(shutdown_tx);
 
@@ -242,8 +424,15 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                 client_shutdown = Some(shutdown_tx);
 
                 tokio::spawn(async move {
-                    match ss_network::client::connect_with_retry(config).await {
-                        Ok(mut conn) => {
+                    // Use connect() with timeout so errors are reported to GUI
+                    // (connect_with_retry would loop forever without feedback)
+                    let connect_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        ss_network::client::connect(config),
+                    ).await;
+
+                    match connect_result {
+                        Ok(Ok(mut conn)) => {
                             // Update state on successful connection
                             {
                                 let mut s = state_clone.write().unwrap();
@@ -253,12 +442,136 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                                 s.last_error = None;
                             }
 
-                            // Keep connection alive, listen for disconnect
+                            // --- Start sharing after connection ---
+
+                            // Suppressed flag: when true, local input capture is disabled
+                            let suppressed = Arc::new(Mutex::new(true)); // starts suppressed (cursor on server)
+                            let suppressed_clone = suppressed.clone();
+
+                            // Start local input capture
+                            let mut input_rx = ss_input::capture::start_capture(suppressed_clone);
+
+                            // Start clipboard monitor
+                            let monitor = ss_clipboard::monitor::ClipboardMonitor::new();
+                            let (mut clip_change_rx, clip_suppress_tx) = ss_clipboard::monitor::start_monitor(monitor);
+
+                            // Task: forward captured input events to server via data channel
+                            let data_tx_input = conn.data_tx.clone();
+                            let _suppressed_input = suppressed.clone();
+                            tokio::spawn(async move {
+                                while let Some(event) = input_rx.recv().await {
+                                    let msg = ss_input::capture::to_message(&event);
+                                    if data_tx_input.send(msg).await.is_err() {
+                                        tracing::info!("Data channel closed, stopping input forward");
+                                        break;
+                                    }
+                                }
+                            });
+
+                            // Task: inject input events received from server
+                            let mut data_rx_inject = conn.data_rx.resubscribe();
+                            tokio::spawn(async move {
+                                loop {
+                                    match data_rx_inject.recv().await {
+                                        Ok(msg) => {
+                                            // Inject input events from server locally
+                                            match &msg {
+                                                Message::MouseMove { .. }
+                                                | Message::MouseButton { .. }
+                                                | Message::MouseScroll { .. }
+                                                | Message::KeyPress { .. } => {
+                                                    ss_input::inject::inject_event(&msg);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                        Err(broadcast::error::RecvError::Closed) => break,
+                                    }
+                                }
+                            });
+
+                            // Task: forward clipboard changes to server
+                            let data_tx_clip = conn.data_tx.clone();
+                            tokio::spawn(async move {
+                                while let Some(change) = clip_change_rx.recv().await {
+                                    match ss_clipboard::sync::prepare_transfer(&change.content) {
+                                        Ok(messages) => {
+                                            for msg in messages {
+                                                if data_tx_clip.send(msg).await.is_err() {
+                                                    tracing::warn!("Failed to send clipboard data");
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to prepare clipboard transfer: {e}");
+                                        }
+                                    }
+                                }
+                            });
+
+                            // Task: receive clipboard data from server and write locally
+                            let mut data_rx_clip = conn.data_rx.resubscribe();
+                            let clip_suppress = clip_suppress_tx.clone();
+                            tokio::spawn(async move {
+                                let mut reassembler: Option<ss_clipboard::sync::ClipboardReassembler> = None;
+                                loop {
+                                    match data_rx_clip.recv().await {
+                                        Ok(msg) => {
+                                            if let Some(content) = ss_clipboard::sync::handle_clipboard_message(&msg, &mut reassembler) {
+                                                let hash = content.hash();
+                                                // Write to local clipboard
+                                                let write_result = match &content {
+                                                    ss_core::protocol::ClipboardContent::Text(text) => {
+                                                        ss_clipboard::monitor::write_clipboard_text(text)
+                                                    }
+                                                    ss_core::protocol::ClipboardContent::Image { width, height, rgba } => {
+                                                        ss_clipboard::monitor::write_clipboard_image(*width, *height, rgba)
+                                                    }
+                                                };
+                                                if let Err(e) = write_result {
+                                                    tracing::error!("Failed to write clipboard: {e}");
+                                                } else {
+                                                    // Suppress local clipboard monitor to prevent echo
+                                                    let _ = clip_suppress.send(hash).await;
+                                                    tracing::info!("Clipboard received from server");
+                                                }
+                                            }
+                                        }
+                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                        Err(broadcast::error::RecvError::Closed) => break,
+                                    }
+                                }
+                            });
+
+                            // Task: listen for boundary events from server to toggle suppression
+                            let mut control_rx_boundary = conn.control_rx.resubscribe();
+                            let suppressed_boundary = suppressed.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    match control_rx_boundary.recv().await {
+                                        Ok(Message::BoundaryEnter { .. }) => {
+                                            tracing::info!("Boundary enter: enabling local input capture");
+                                            *suppressed_boundary.lock().unwrap() = false;
+                                        }
+                                        Ok(Message::BoundaryLeave { .. }) => {
+                                            tracing::info!("Boundary leave: disabling local input capture");
+                                            *suppressed_boundary.lock().unwrap() = true;
+                                        }
+                                        Ok(_) => {}
+                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                        Err(broadcast::error::RecvError::Closed) => break,
+                                    }
+                                }
+                            });
+
+                            // Main loop: listen for disconnect
                             loop {
                                 tokio::select! {
                                     msg = conn.control_rx.recv() => {
                                         match msg {
-                                            Ok(ss_core::protocol::Message::Heartbeat) => {}
+                                            Ok(Message::Heartbeat) => {}
                                             Ok(_) => {}
                                             Err(broadcast::error::RecvError::Lagged(_)) => {}
                                             Err(broadcast::error::RecvError::Closed) => {
@@ -275,11 +588,17 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             s.client_server_addr = None;
                             s.server_screen_size = None;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::error!("Client connection error: {e}");
                             let mut s = state_clone.write().unwrap();
                             s.client_connected = false;
                             s.last_error = Some(format!("Connection failed: {e}"));
+                        }
+                        Err(_) => {
+                            tracing::error!("Client connection timed out");
+                            let mut s = state_clone.write().unwrap();
+                            s.client_connected = false;
+                            s.last_error = Some("Connection timed out (10s)".to_string());
                         }
                     }
                 });
@@ -365,9 +684,121 @@ async fn run_headless_client(
         device_name: name,
     };
 
-    let _conn = ss_network::client::connect_with_retry(config).await?;
+    let conn = ss_network::client::connect_with_retry(config).await?;
     tracing::info!("Connected. Press Ctrl+C to disconnect.");
 
+    // Suppressed flag: starts suppressed (cursor on server side)
+    let suppressed = Arc::new(Mutex::new(true));
+
+    // Start local input capture
+    let suppressed_clone = suppressed.clone();
+    let mut input_rx = ss_input::capture::start_capture(suppressed_clone);
+
+    // Start clipboard monitor
+    let monitor = ss_clipboard::monitor::ClipboardMonitor::new();
+    let (mut clip_change_rx, clip_suppress_tx) = ss_clipboard::monitor::start_monitor(monitor);
+
+    // Task: forward captured input events to server
+    let data_tx_input = conn.data_tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = input_rx.recv().await {
+            let msg = ss_input::capture::to_message(&event);
+            if data_tx_input.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Task: inject input events received from server
+    let mut data_rx_inject = conn.data_rx.resubscribe();
+    tokio::spawn(async move {
+        loop {
+            match data_rx_inject.recv().await {
+                Ok(msg) => {
+                    match &msg {
+                        Message::MouseMove { .. }
+                        | Message::MouseButton { .. }
+                        | Message::MouseScroll { .. }
+                        | Message::KeyPress { .. } => {
+                            ss_input::inject::inject_event(&msg);
+                        }
+                        _ => {}
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Task: forward clipboard changes to server
+    let data_tx_clip = conn.data_tx.clone();
+    tokio::spawn(async move {
+        while let Some(change) = clip_change_rx.recv().await {
+            if let Ok(messages) = ss_clipboard::sync::prepare_transfer(&change.content) {
+                for msg in messages {
+                    if data_tx_clip.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Task: receive clipboard data from server
+    let mut data_rx_clip = conn.data_rx.resubscribe();
+    let clip_suppress = clip_suppress_tx.clone();
+    tokio::spawn(async move {
+        let mut reassembler: Option<ss_clipboard::sync::ClipboardReassembler> = None;
+        loop {
+            match data_rx_clip.recv().await {
+                Ok(msg) => {
+                    if let Some(content) = ss_clipboard::sync::handle_clipboard_message(&msg, &mut reassembler) {
+                        let hash = content.hash();
+                        let write_result = match &content {
+                            ss_core::protocol::ClipboardContent::Text(text) => {
+                                ss_clipboard::monitor::write_clipboard_text(text)
+                            }
+                            ss_core::protocol::ClipboardContent::Image { width, height, rgba } => {
+                                ss_clipboard::monitor::write_clipboard_image(*width, *height, rgba)
+                            }
+                        };
+                        if let Err(e) = write_result {
+                            tracing::error!("Failed to write clipboard: {e}");
+                        } else {
+                            let _ = clip_suppress.send(hash).await;
+                            tracing::info!("Clipboard received from server");
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Task: listen for boundary events to toggle suppression
+    let mut control_rx_boundary = conn.control_rx.resubscribe();
+    let suppressed_boundary = suppressed.clone();
+    tokio::spawn(async move {
+        loop {
+            match control_rx_boundary.recv().await {
+                Ok(Message::BoundaryEnter { .. }) => {
+                    tracing::info!("Boundary enter: enabling local input capture");
+                    *suppressed_boundary.lock().unwrap() = false;
+                }
+                Ok(Message::BoundaryLeave { .. }) => {
+                    tracing::info!("Boundary leave: disabling local input capture");
+                    *suppressed_boundary.lock().unwrap() = true;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Wait for Ctrl+C
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("Disconnecting");
     Ok(())
