@@ -236,8 +236,8 @@ async fn handle_control_connection(
     let (mut reader, writer) = tokio::io::split(tls_stream);
 
     // Single writer task: handles both heartbeats and control messages
+    // Exits when ctrl_rx closes (ctrl_tx dropped = client removed from clients map)
     let mut hb_interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-    let mut shutdown_writer = state.broadcast_rx.subscribe();
     tokio::spawn(async move {
         let mut writer = writer;
         loop {
@@ -247,13 +247,18 @@ async fn handle_control_connection(
                         break;
                     }
                 }
-                Some(msg) = ctrl_rx.recv() => {
-                    if write_frame(&mut writer, &msg).await.is_err() {
-                        break;
+                msg = ctrl_rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            if write_frame(&mut writer, &msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            // ctrl_tx dropped, client disconnected
+                            break;
+                        }
                     }
-                }
-                _ = shutdown_writer.recv() => {
-                    break;
                 }
             }
         }
