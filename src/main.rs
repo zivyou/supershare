@@ -156,7 +156,10 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
             } => {
                 tracing::info!("Starting server on port {control_port}");
 
-                let server_state = Arc::new(ss_network::server::ServerState::new(1920, 1080));
+                // Detect actual screen resolution
+                let (screen_w, screen_h) = detect_screen_size();
+                tracing::info!("Detected screen: {screen_w}x{screen_h}");
+                let server_state = Arc::new(ss_network::server::ServerState::new(screen_w, screen_h));
 
                 // Listen for server events
                 let mut notify_rx = server_state.notify_tx.subscribe();
@@ -188,7 +191,7 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                 let mut input_rx = ss_input::capture::start_capture(suppressed_clone);
 
                 // Coordinate system for boundary detection
-                let coord = Arc::new(Mutex::new(ss_input::boundary::CoordinateSystem::new(1920, 1080)));
+                let coord = Arc::new(Mutex::new(ss_input::boundary::CoordinateSystem::new(screen_w, screen_h)));
 
                 // Track which screen the cursor is on (0 = server, 1+ = client)
                 let active_screen: Arc<Mutex<u8>> = Arc::new(Mutex::new(0));
@@ -675,7 +678,9 @@ async fn run_headless_server(
 ) -> anyhow::Result<()> {
     tracing::info!("Starting headless server on port {port}");
 
-    let server_state = Arc::new(ss_network::server::ServerState::new(1920, 1080));
+    let (screen_w, screen_h) = detect_screen_size();
+    tracing::info!("Detected screen: {screen_w}x{screen_h}");
+    let server_state = Arc::new(ss_network::server::ServerState::new(screen_w, screen_h));
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     // Log client events
@@ -855,6 +860,78 @@ async fn run_headless_client(
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("Disconnecting");
     Ok(())
+}
+
+/// Detect the primary screen resolution
+fn detect_screen_size() -> (u32, u32) {
+    // Try xrandr first (Linux X11)
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("xrandr")
+            .arg("--query")
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                // Look for "connected primary" line with resolution
+                // e.g., "eDP-1 connected primary 1680x1050+0+0"
+                if line.contains("connected primary") || (line.contains("connected") && line.contains("+0+0")) {
+                    for part in line.split_whitespace() {
+                        if let Some(res) = part.strip_suffix("+0+0") {
+                            let dims: Vec<&str> = res.split('x').collect();
+                            if dims.len() == 2 {
+                                if let (Ok(w), Ok(h)) = (dims[0].parse::<u32>(), dims[1].parse::<u32>()) {
+                                    return (w, h);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback: look for first resolution line with "*"
+            for line in stdout.lines() {
+                if line.contains('*') {
+                    for part in line.split_whitespace() {
+                        let dims: Vec<&str> = part.split('x').collect();
+                        if dims.len() == 2 {
+                            if dims[0].parse::<u32>().is_ok() && dims[1].parse::<u32>().is_ok() {
+                                let w: u32 = dims[0].parse().unwrap();
+                                let h: u32 = dims[1].parse().unwrap();
+                                return (w, h);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Try WMIC on Windows
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("wmic")
+            .args(["desktopmonitor", "get", "screenwidth,screenheight", "/format:value"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut w = 0u32;
+            let mut h = 0u32;
+            for line in stdout.lines() {
+                if let Some(val) = line.strip_prefix("ScreenWidth=") {
+                    w = val.trim().parse().unwrap_or(0);
+                }
+                if let Some(val) = line.strip_prefix("ScreenHeight=") {
+                    h = val.trim().parse().unwrap_or(0);
+                }
+            }
+            if w > 0 && h > 0 {
+                return (w, h);
+            }
+        }
+    }
+
+    tracing::warn!("Could not detect screen size, using default 1920x1080");
+    (1920, 1080)
 }
 
 /// Generate certificates

@@ -85,7 +85,8 @@ impl CoordinateSystem {
         if local_x >= (screen.width as f32 - BOUNDARY_ZONE_PX as f32) {
             // Find the screen to the right
             let right_screen = self.screens.iter().find(|s| s.offset_x == screen.offset_x + screen.width)?;
-            return Some((right_screen.id, 0.0, local_y));
+            // Enter past the boundary zone to avoid immediate bounce-back
+            return Some((right_screen.id, (BOUNDARY_ZONE_PX + 1) as f32, local_y));
         }
 
         // Check left edge
@@ -152,7 +153,7 @@ mod tests {
         assert!(result.is_some());
         let (target, enter_x, enter_y) = result.unwrap();
         assert_eq!(target, 1);
-        assert_eq!(enter_x, 0.0);
+        assert_eq!(enter_x, 6.0); // BOUNDARY_ZONE_PX + 1 to avoid bounce-back
         assert_eq!(enter_y, 500.0);
     }
 
