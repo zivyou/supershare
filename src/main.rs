@@ -597,45 +597,35 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                                 }
                             });
 
-                            // Task: listen for boundary events from server to toggle suppression
-                            let mut control_rx_boundary = conn.control_rx.resubscribe();
+                            // Single control channel handler: boundary events + disconnect detection
                             let suppressed_boundary = suppressed.clone();
-                            tokio::spawn(async move {
-                                loop {
-                                    match control_rx_boundary.recv().await {
-                                        Ok(Message::BoundaryEnter { enter_x, enter_y, target_screen }) => {
-                                            tracing::info!("*** CLIENT BoundaryEnter: screen={target_screen} pos=({enter_x:.0}, {enter_y:.0}) ***");
-                                            // Move cursor to the enter position using inject
-                                            let move_msg = Message::MouseMove { x: enter_x, y: enter_y };
-                                            ss_input::inject::inject_event(&move_msg);
-                                            tracing::info!("Injected MouseMove to ({enter_x:.0}, {enter_y:.0})");
-                                            // Unsuppress to start capturing
-                                            *suppressed_boundary.lock().unwrap() = false;
-                                            tracing::info!("Local capture unsuppressed");
-                                        }
-                                        Ok(Message::BoundaryLeave { .. }) => {
-                                            tracing::info!("Boundary leave: disabling local input capture");
-                                            *suppressed_boundary.lock().unwrap() = true;
-                                        }
-                                        Ok(_) => {}
-                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                        Err(broadcast::error::RecvError::Closed) => break,
-                                    }
-                                }
-                            });
-
-                            // Main loop: listen for disconnect
+                            let state_for_disconnect = state_clone.clone();
                             loop {
-                                tokio::select! {
-                                    msg = conn.control_rx.recv() => {
-                                        match msg {
-                                            Ok(Message::Heartbeat) => {}
-                                            Ok(_) => {}
-                                            Err(broadcast::error::RecvError::Lagged(_)) => {}
-                                            Err(broadcast::error::RecvError::Closed) => {
-                                                break;
-                                            }
-                                        }
+                                match conn.control_rx.recv().await {
+                                    Ok(Message::BoundaryEnter { enter_x, enter_y, target_screen }) => {
+                                        tracing::info!("*** CLIENT BoundaryEnter: screen={target_screen} pos=({enter_x:.0}, {enter_y:.0}) ***");
+                                        // Move cursor to the enter position using inject
+                                        let move_msg = Message::MouseMove { x: enter_x, y: enter_y };
+                                        ss_input::inject::inject_event(&move_msg);
+                                        tracing::info!("Injected MouseMove to ({enter_x:.0}, {enter_y:.0})");
+                                        // Unsuppress to start capturing
+                                        *suppressed_boundary.lock().unwrap() = false;
+                                        tracing::info!("Local capture unsuppressed");
+                                    }
+                                    Ok(Message::BoundaryLeave { .. }) => {
+                                        tracing::info!("Boundary leave: disabling local input capture");
+                                        *suppressed_boundary.lock().unwrap() = true;
+                                    }
+                                    Ok(Message::Heartbeat) => {
+                                        // Keep-alive, no action needed
+                                    }
+                                    Ok(_) => {
+                                        // Other control messages, ignore
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        tracing::info!("Control channel closed");
+                                        break;
                                     }
                                 }
                             }
