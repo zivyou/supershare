@@ -490,7 +490,6 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             // Also detect boundary: if cursor hits left edge, return control to server
                             let data_tx_input = conn.data_tx.clone();
                             let suppressed_input = suppressed.clone();
-                            let _server_width = server_screen.0 as f32;
                             tokio::spawn(async move {
                                 while let Some(event) = input_rx.recv().await {
                                     // Check boundary on mouse moves: left edge = return to server
@@ -505,6 +504,12 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                                         }
                                     }
                                     let msg = ss_input::capture::to_message(&event);
+                                    // Inject locally first — suppress capture briefly to prevent
+                                    // rdev from re-capturing the simulated event (feedback loop)
+                                    *suppressed_input.lock().unwrap() = true;
+                                    ss_input::inject::inject_event(&msg);
+                                    *suppressed_input.lock().unwrap() = false;
+                                    // Forward to server
                                     if data_tx_input.send(msg).await.is_err() {
                                         tracing::info!("Data channel closed, stopping input forward");
                                         break;
@@ -763,6 +768,10 @@ async fn run_headless_client(
                 }
             }
             let msg = ss_input::capture::to_message(&event);
+            // Inject locally first — suppress capture briefly to prevent feedback loop
+            *suppressed_input.lock().unwrap() = true;
+            ss_input::inject::inject_event(&msg);
+            *suppressed_input.lock().unwrap() = false;
             if data_tx_input.send(msg).await.is_err() {
                 break;
             }
