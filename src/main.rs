@@ -249,16 +249,22 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                                         // Moving to client: forward last position, then suppress
                                         let msg = Message::MouseMove { x: enter_x, y: enter_y };
                                         let clients = server_state_input.clients.read().await;
+                                        tracing::info!("Sending MouseMove({enter_x:.0}, {enter_y:.0}) to {} clients", clients.len());
                                         for (name, client) in clients.iter() {
-                                            let _ = client.data_tx.send(msg.clone()).await;
+                                            if let Err(e) = client.data_tx.send(msg.clone()).await {
+                                                tracing::error!("Failed to send MouseMove to {name}: {e}");
+                                            }
                                         }
                                         // Send BoundaryEnter to client
-                                        for (_, client) in clients.iter() {
-                                            let _ = client.control_tx.send(Message::BoundaryEnter {
+                                        for (name, client) in clients.iter() {
+                                            tracing::info!("Sending BoundaryEnter to {name}");
+                                            if let Err(e) = client.control_tx.send(Message::BoundaryEnter {
                                                 target_screen: target,
                                                 enter_x,
                                                 enter_y,
-                                            }).await;
+                                            }).await {
+                                                tracing::error!("Failed to send BoundaryEnter to {name}: {e}");
+                                            }
                                         }
                                         // Suppress server input capture AFTER sending
                                         *suppressed_input.lock().unwrap() = true;
@@ -508,16 +514,24 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
 
                             // Task: inject input events received from server
                             let mut data_rx_inject = conn.data_rx.resubscribe();
+                            let suppressed_inject = suppressed.clone();
                             tokio::spawn(async move {
+                                let mut inject_count: u64 = 0;
                                 loop {
                                     match data_rx_inject.recv().await {
                                         Ok(msg) => {
-                                            // Inject input events from server locally
                                             match &msg {
-                                                Message::MouseMove { .. }
-                                                | Message::MouseButton { .. }
+                                                Message::MouseMove { x, y } => {
+                                                    inject_count += 1;
+                                                    if inject_count % 50 == 1 {
+                                                        tracing::info!("Injecting MouseMove ({x:.0}, {y:.0}), suppressed={}", *suppressed_inject.lock().unwrap());
+                                                    }
+                                                    ss_input::inject::inject_event(&msg);
+                                                }
+                                                Message::MouseButton { .. }
                                                 | Message::MouseScroll { .. }
                                                 | Message::KeyPress { .. } => {
+                                                    tracing::debug!("Injecting input event from server");
                                                     ss_input::inject::inject_event(&msg);
                                                 }
                                                 _ => {}
@@ -589,15 +603,15 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             tokio::spawn(async move {
                                 loop {
                                     match control_rx_boundary.recv().await {
-                                        Ok(Message::BoundaryEnter { enter_x, enter_y, .. }) => {
-                                            tracing::info!("Boundary enter at ({enter_x:.0}, {enter_y:.0}): enabling local input capture");
+                                        Ok(Message::BoundaryEnter { enter_x, enter_y, target_screen }) => {
+                                            tracing::info!("*** CLIENT BoundaryEnter: screen={target_screen} pos=({enter_x:.0}, {enter_y:.0}) ***");
                                             // Move cursor to the enter position using inject
-                                            ss_input::inject::inject_event(&Message::MouseMove {
-                                                x: enter_x,
-                                                y: enter_y,
-                                            });
+                                            let move_msg = Message::MouseMove { x: enter_x, y: enter_y };
+                                            ss_input::inject::inject_event(&move_msg);
+                                            tracing::info!("Injected MouseMove to ({enter_x:.0}, {enter_y:.0})");
                                             // Unsuppress to start capturing
                                             *suppressed_boundary.lock().unwrap() = false;
+                                            tracing::info!("Local capture unsuppressed");
                                         }
                                         Ok(Message::BoundaryLeave { .. }) => {
                                             tracing::info!("Boundary leave: disabling local input capture");
