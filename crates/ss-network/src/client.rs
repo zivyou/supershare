@@ -34,11 +34,19 @@ pub struct ClientConnection {
 /// Returns a ClientConnection on success.
 pub async fn connect(config: ClientConfig) -> anyhow::Result<ClientConnection> {
     let tls_config = tls::build_client_config(&config.cert_path, &config.key_path, &config.ca_path)?;
-    let server_name = tls::parse_server_name(&config.server_address)?;
+
+    // Ensure address has a port (default to 9876)
+    let server_address = if config.server_address.contains(':') {
+        config.server_address.clone()
+    } else {
+        format!("{}:9876", config.server_address)
+    };
+
+    let server_name = tls::parse_server_name(&server_address)?;
 
     // Connect control channel
-    tracing::info!("Connecting control channel to {}", config.server_address);
-    let control_stream = TcpStream::connect(&config.server_address).await?;
+    tracing::info!("Connecting control channel to {}", server_address);
+    let control_stream = TcpStream::connect(&server_address).await?;
     let connector = tokio_rustls::TlsConnector::from(tls_config.clone());
     let mut control_tls = connector.connect(server_name.clone(), control_stream).await?;
 
@@ -115,7 +123,7 @@ pub async fn connect(config: ClientConfig) -> anyhow::Result<ClientConnection> {
 
     // Connect data channel (port = control port + 1)
     let data_address = {
-        let parts: Vec<&str> = config.server_address.split(':').collect();
+        let parts: Vec<&str> = server_address.split(':').collect();
         if parts.len() == 2 {
             let port: u16 = parts[1].parse().unwrap_or(9876);
             format!("{}:{}", parts[0], port + 1)
