@@ -490,7 +490,7 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             // Also detect boundary: if cursor hits left edge, return control to server
                             let data_tx_input = conn.data_tx.clone();
                             let suppressed_input = suppressed.clone();
-                            let server_width = server_screen.0 as f32;
+                            let _server_width = server_screen.0 as f32;
                             tokio::spawn(async move {
                                 while let Some(event) = input_rx.recv().await {
                                     // Check boundary on mouse moves: left edge = return to server
@@ -599,7 +599,7 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
 
                             // Single control channel handler: boundary events + disconnect detection
                             let suppressed_boundary = suppressed.clone();
-                            let state_for_disconnect = state_clone.clone();
+                            let _state_for_disconnect = state_clone.clone();
                             loop {
                                 match conn.control_rx.recv().await {
                                     Ok(Message::BoundaryEnter { enter_x, enter_y, target_screen }) => {

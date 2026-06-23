@@ -233,12 +233,13 @@ async fn handle_control_connection(
     });
 
     // Split the TLS stream for concurrent read/write
-    let (mut reader, mut writer) = tokio::io::split(tls_stream);
+    let (mut reader, writer) = tokio::io::split(tls_stream);
 
-    // Spawn heartbeat sender
+    // Single writer task: handles both heartbeats and control messages
     let mut hb_interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-    let mut shutdown_hb = state.broadcast_rx.subscribe();
+    let mut shutdown_writer = state.broadcast_rx.subscribe();
     tokio::spawn(async move {
+        let mut writer = writer;
         loop {
             tokio::select! {
                 _ = hb_interval.tick() => {
@@ -246,7 +247,12 @@ async fn handle_control_connection(
                         break;
                     }
                 }
-                _ = shutdown_hb.recv() => {
+                Some(msg) = ctrl_rx.recv() => {
+                    if write_frame(&mut writer, &msg).await.is_err() {
+                        break;
+                    }
+                }
+                _ = shutdown_writer.recv() => {
                     break;
                 }
             }
