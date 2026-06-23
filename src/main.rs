@@ -203,13 +203,13 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                 let coord_input = coord.clone();
                 let suppressed_input = suppressed.clone();
                 tokio::spawn(async move {
+                    let mut move_count: u64 = 0;
                     while let Some(event) = input_rx.recv().await {
                         let screen = *active_screen_input.lock().unwrap();
 
                         // Only forward if cursor is on a client screen (screen > 0)
                         if screen > 0 {
                             let msg = ss_input::capture::to_message(&event);
-                            // Forward to all clients
                             let clients = server_state_input.clients.read().await;
                             for (name, client) in clients.iter() {
                                 if let Err(e) = client.data_tx.send(msg.clone()).await {
@@ -220,7 +220,19 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
 
                         // Check boundary on mouse moves
                         if let ss_input::capture::InputEvent::MouseMove { x, y } = event {
+                            move_count += 1;
                             let current_screen = *active_screen_input.lock().unwrap();
+
+                            // Log near edges for debugging
+                            let screen_width = {
+                                let c = coord_input.lock().unwrap();
+                                c.screens.get(current_screen as usize).map(|s| s.width).unwrap_or(1920)
+                            };
+                            let near_edge = x as f32 >= (screen_width as f32 - 20.0) || x as f32 <= 20.0;
+                            if move_count % 200 == 0 || near_edge {
+                                tracing::debug!("Mouse: x={x:.0} y={y:.0} screen={current_screen} width={screen_width}");
+                            }
+
                             // Check boundary without holding lock across await
                             let boundary_result = {
                                 let coord = coord_input.lock().unwrap();
@@ -228,20 +240,16 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             };
                             if let Some((target, enter_x, enter_y)) = boundary_result {
                                 if target != current_screen {
-                                    tracing::info!("Boundary crossed: screen {current_screen} -> {target}");
-                                    *active_screen_input.lock().unwrap() = target;
+                                    tracing::info!("*** BOUNDARY CROSSED: screen {current_screen} -> {target} at ({enter_x:.0}, {enter_y:.0}) ***");
 
-                                    if target == 0 {
-                                        // Returning to server: unsuppress capture, send BoundaryLeave
-                                        *suppressed_input.lock().unwrap() = false;
+                                    if target > 0 {
+                                        // Moving to client: forward last position, then suppress
+                                        let msg = Message::MouseMove { x: enter_x, y: enter_y };
                                         let clients = server_state_input.clients.read().await;
-                                        for (_, client) in clients.iter() {
-                                            let _ = client.control_tx.send(Message::BoundaryLeave { source_screen: current_screen }).await;
+                                        for (name, client) in clients.iter() {
+                                            let _ = client.data_tx.send(msg.clone()).await;
                                         }
-                                    } else {
-                                        // Moving to client: suppress local capture, send BoundaryEnter
-                                        *suppressed_input.lock().unwrap() = true;
-                                        let clients = server_state_input.clients.read().await;
+                                        // Send BoundaryEnter to client
                                         for (_, client) in clients.iter() {
                                             let _ = client.control_tx.send(Message::BoundaryEnter {
                                                 target_screen: target,
@@ -249,7 +257,17 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                                                 enter_y,
                                             }).await;
                                         }
+                                        // Suppress server input capture AFTER sending
+                                        *suppressed_input.lock().unwrap() = true;
+                                    } else {
+                                        // Returning to server: unsuppress, send BoundaryLeave
+                                        *suppressed_input.lock().unwrap() = false;
+                                        let clients = server_state_input.clients.read().await;
+                                        for (_, client) in clients.iter() {
+                                            let _ = client.control_tx.send(Message::BoundaryLeave { source_screen: current_screen }).await;
+                                        }
                                     }
+                                    *active_screen_input.lock().unwrap() = target;
                                 }
                             }
                         }
@@ -448,6 +466,10 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             let suppressed = Arc::new(Mutex::new(true)); // starts suppressed (cursor on server)
                             let suppressed_clone = suppressed.clone();
 
+                            // Server screen dimensions (received during handshake)
+                            let server_screen = conn.server_screen.unwrap_or((1920, 1080));
+                            tracing::info!("Server screen: {}x{}", server_screen.0, server_screen.1);
+
                             // Start local input capture
                             let mut input_rx = ss_input::capture::start_capture(suppressed_clone);
 
@@ -456,10 +478,23 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             let (mut clip_change_rx, clip_suppress_tx) = ss_clipboard::monitor::start_monitor(monitor);
 
                             // Task: forward captured input events to server via data channel
+                            // Also detect boundary: if cursor hits left edge, return control to server
                             let data_tx_input = conn.data_tx.clone();
-                            let _suppressed_input = suppressed.clone();
+                            let suppressed_input = suppressed.clone();
+                            let server_width = server_screen.0 as f32;
                             tokio::spawn(async move {
                                 while let Some(event) = input_rx.recv().await {
+                                    // Check boundary on mouse moves: left edge = return to server
+                                    if let ss_input::capture::InputEvent::MouseMove { x, y: _ } = &event {
+                                        if *x as f32 <= 5.0 {
+                                            tracing::info!("Client boundary: cursor at left edge (x={x:.0}), returning control to server");
+                                            // Suppress local capture
+                                            *suppressed_input.lock().unwrap() = true;
+                                            // Send BoundaryLeave to server
+                                            let _ = data_tx_input.send(Message::BoundaryLeave { source_screen: 1 }).await;
+                                            continue; // Don't forward this event
+                                        }
+                                    }
                                     let msg = ss_input::capture::to_message(&event);
                                     if data_tx_input.send(msg).await.is_err() {
                                         tracing::info!("Data channel closed, stopping input forward");
@@ -551,8 +586,14 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             tokio::spawn(async move {
                                 loop {
                                     match control_rx_boundary.recv().await {
-                                        Ok(Message::BoundaryEnter { .. }) => {
-                                            tracing::info!("Boundary enter: enabling local input capture");
+                                        Ok(Message::BoundaryEnter { enter_x, enter_y, .. }) => {
+                                            tracing::info!("Boundary enter at ({enter_x:.0}, {enter_y:.0}): enabling local input capture");
+                                            // Move cursor to the enter position using inject
+                                            ss_input::inject::inject_event(&Message::MouseMove {
+                                                x: enter_x,
+                                                y: enter_y,
+                                            });
+                                            // Unsuppress to start capturing
                                             *suppressed_boundary.lock().unwrap() = false;
                                         }
                                         Ok(Message::BoundaryLeave { .. }) => {
@@ -698,10 +739,20 @@ async fn run_headless_client(
     let monitor = ss_clipboard::monitor::ClipboardMonitor::new();
     let (mut clip_change_rx, clip_suppress_tx) = ss_clipboard::monitor::start_monitor(monitor);
 
-    // Task: forward captured input events to server
+    // Task: forward captured input events to server, with boundary detection
     let data_tx_input = conn.data_tx.clone();
+    let suppressed_input = suppressed.clone();
     tokio::spawn(async move {
         while let Some(event) = input_rx.recv().await {
+            // Check boundary: left edge = return to server
+            if let ss_input::capture::InputEvent::MouseMove { x, y: _ } = &event {
+                if *x as f32 <= 5.0 {
+                    tracing::info!("Client boundary: cursor at left edge (x={x:.0}), returning control");
+                    *suppressed_input.lock().unwrap() = true;
+                    let _ = data_tx_input.send(Message::BoundaryLeave { source_screen: 1 }).await;
+                    continue;
+                }
+            }
             let msg = ss_input::capture::to_message(&event);
             if data_tx_input.send(msg).await.is_err() {
                 break;
@@ -783,8 +834,10 @@ async fn run_headless_client(
     tokio::spawn(async move {
         loop {
             match control_rx_boundary.recv().await {
-                Ok(Message::BoundaryEnter { .. }) => {
-                    tracing::info!("Boundary enter: enabling local input capture");
+                Ok(Message::BoundaryEnter { enter_x, enter_y, .. }) => {
+                    tracing::info!("Boundary enter at ({enter_x:.0}, {enter_y:.0}): enabling local input capture");
+                    // Move cursor to enter position
+                    ss_input::inject::inject_event(&Message::MouseMove { x: enter_x, y: enter_y });
                     *suppressed_boundary.lock().unwrap() = false;
                 }
                 Ok(Message::BoundaryLeave { .. }) => {
