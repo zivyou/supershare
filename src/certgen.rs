@@ -1,5 +1,6 @@
 use rcgen::{CertificateParams, DnType, Ia5String, KeyPair, SanType};
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 
 /// Generate a self-signed CA certificate and key
@@ -32,15 +33,24 @@ pub fn generate_ca(output_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Generate a self-signed device certificate
-/// Note: For simplicity, this generates a self-signed cert rather than CA-signed.
-/// In production, you would use the CA to sign device certs.
+/// Generate a device certificate signed by the CA
 pub fn generate_device_cert(
     output_dir: &Path,
+    ca_cert_path: &Path,
+    ca_key_path: &Path,
     device_name: &str,
+    extra_ips: &[IpAddr],
 ) -> anyhow::Result<()> {
     fs::create_dir_all(output_dir)?;
 
+    // Load CA cert and key
+    let ca_cert_pem = fs::read_to_string(ca_cert_path)?;
+    let ca_key_pem = fs::read_to_string(ca_key_path)?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem)?;
+    let ca_cert_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?;
+    let ca_cert = ca_cert_params.self_signed(&ca_key)?;
+
+    // Create device cert params
     let mut params = CertificateParams::new(vec![device_name.to_string()])?;
     params
         .distinguished_name
@@ -53,9 +63,18 @@ pub fn generate_device_cert(
     params
         .subject_alt_names
         .push(SanType::DnsName(localhost_dns));
+    // Add IP SANs for common scenarios
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(IpAddr::from([127, 0, 0, 1])));
+    // Add user-specified IPs
+    for ip in extra_ips {
+        params.subject_alt_names.push(SanType::IpAddress(*ip));
+    }
 
+    // Sign with CA
     let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
+    let cert = params.signed_by(&key_pair, &ca_cert, &ca_key)?;
 
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();

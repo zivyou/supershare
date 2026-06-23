@@ -54,6 +54,18 @@ struct Cli {
     /// Generate device certificate with this name
     #[arg(long)]
     device: Option<String>,
+
+    /// CA certificate path (for signing device certs)
+    #[arg(long)]
+    ca_cert: Option<PathBuf>,
+
+    /// CA key path (for signing device certs)
+    #[arg(long)]
+    ca_key: Option<PathBuf>,
+
+    /// Additional IP addresses for certificate SAN (can specify multiple)
+    #[arg(long)]
+    ip: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -68,7 +80,7 @@ fn main() -> anyhow::Result<()> {
 
     // Certificate generation mode (no async needed)
     if cli.gen_cert {
-        return run_gen_cert(cli.output, cli.device);
+        return run_gen_cert(cli.output, cli.device, cli.ca_cert, cli.ca_key, cli.ip);
     }
 
     // Headless server mode
@@ -362,17 +374,34 @@ async fn run_headless_client(
 }
 
 /// Generate certificates
-fn run_gen_cert(output: PathBuf, device: Option<String>) -> anyhow::Result<()> {
+fn run_gen_cert(
+    output: PathBuf,
+    device: Option<String>,
+    ca_cert: Option<PathBuf>,
+    ca_key: Option<PathBuf>,
+    ips: Vec<String>,
+) -> anyhow::Result<()> {
     match device {
         Some(device_name) => {
-            certgen::generate_device_cert(&output, &device_name)?;
+            let ca_cert_path = ca_cert.ok_or_else(|| {
+                anyhow::anyhow!("--ca-cert is required when generating device certificate")
+            })?;
+            let ca_key_path = ca_key.ok_or_else(|| {
+                anyhow::anyhow!("--ca-key is required when generating device certificate")
+            })?;
+            let extra_ips: Vec<std::net::IpAddr> = ips
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("Invalid IP address: {e}"))?;
+            certgen::generate_device_cert(&output, &ca_cert_path, &ca_key_path, &device_name, &extra_ips)?;
             println!("Device certificate for '{}' generated in {}", device_name, output.display());
         }
         None => {
             certgen::generate_ca(&output)?;
             println!("CA certificate and key generated in {}", output.display());
             println!("Next steps:");
-            println!("  1. Generate device certs: supershare --gen-cert --device <name>");
+            println!("  1. Generate device certs: supershare --gen-cert --device <name> --ca-cert certs/ca.pem --ca-key certs/ca-key.pem --ip <server-ip>");
         }
     }
     Ok(())
