@@ -915,56 +915,20 @@ fn detect_screen_size() -> (u32, u32) {
         }
     }
 
-    // Try WMIC on Windows
+    // Windows: Use Win32 API (GetSystemMetrics)
     #[cfg(target_os = "windows")]
     {
-        // Try wmic first
-        tracing::debug!("Trying wmic...");
-        if let Ok(output) = std::process::Command::new("wmic")
-            .args(["desktopmonitor", "get", "screenwidth,screenheight", "/format:value"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            tracing::debug!("wmic output: {}", stdout.trim());
-            let mut w = 0u32;
-            let mut h = 0u32;
-            for line in stdout.lines() {
-                if let Some(val) = line.strip_prefix("ScreenWidth=") {
-                    w = val.trim().parse().unwrap_or(0);
-                }
-                if let Some(val) = line.strip_prefix("ScreenHeight=") {
-                    h = val.trim().parse().unwrap_or(0);
-                }
-            }
+        tracing::debug!("Trying Win32 GetSystemMetrics...");
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+
+            let w = GetSystemMetrics(SM_CXSCREEN) as u32;
+            let h = GetSystemMetrics(SM_CYSCREEN) as u32;
             if w > 0 && h > 0 {
-                tracing::info!("Detected screen via wmic: {w}x{h}");
+                tracing::info!("Detected screen via Win32 API: {w}x{h}");
                 return (w, h);
             }
-            tracing::warn!("wmic output did not contain resolution info");
-        } else {
-            tracing::warn!("wmic command failed");
-        }
-
-        // Fallback: try PowerShell with different approach
-        tracing::debug!("Trying PowerShell Get-CimInstance...");
-        if let Ok(output) = std::process::Command::new("powershell")
-            .args(["-Command", "(Get-CimInstance -ClassName Win32_VideoController).CurrentHorizontalResolution, (Get-CimInstance -ClassName Win32_VideoController).CurrentVerticalResolution"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            tracing::debug!("PowerShell output: {}", stdout.trim());
-            let parts: Vec<&str> = stdout.trim().split(',').collect();
-            if parts.len() == 2 {
-                if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>()) {
-                    if w > 0 && h > 0 {
-                        tracing::info!("Detected screen via PowerShell: {w}x{h}");
-                        return (w, h);
-                    }
-                }
-            }
-            tracing::warn!("PowerShell output did not contain resolution info");
-        } else {
-            tracing::warn!("PowerShell command failed");
+            tracing::warn!("GetSystemMetrics returned invalid size: {w}x{h}");
         }
     }
 
