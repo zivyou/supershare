@@ -865,9 +865,12 @@ async fn run_headless_client(
 
 /// Detect the primary screen resolution
 fn detect_screen_size() -> (u32, u32) {
+    tracing::info!("Detecting screen size...");
+
     // Try xrandr first (Linux X11)
     #[cfg(target_os = "linux")]
     {
+        tracing::debug!("Trying xrandr...");
         if let Ok(output) = std::process::Command::new("xrandr")
             .arg("--query")
             .output()
@@ -882,6 +885,7 @@ fn detect_screen_size() -> (u32, u32) {
                             let dims: Vec<&str> = res.split('x').collect();
                             if dims.len() == 2 {
                                 if let (Ok(w), Ok(h)) = (dims[0].parse::<u32>(), dims[1].parse::<u32>()) {
+                                    tracing::info!("Detected screen via xrandr: {w}x{h}");
                                     return (w, h);
                                 }
                             }
@@ -898,23 +902,30 @@ fn detect_screen_size() -> (u32, u32) {
                             if dims[0].parse::<u32>().is_ok() && dims[1].parse::<u32>().is_ok() {
                                 let w: u32 = dims[0].parse().unwrap();
                                 let h: u32 = dims[1].parse().unwrap();
+                                tracing::info!("Detected screen via xrandr fallback: {w}x{h}");
                                 return (w, h);
                             }
                         }
                     }
                 }
             }
+            tracing::warn!("xrandr output did not contain resolution info");
+        } else {
+            tracing::warn!("xrandr command failed");
         }
     }
 
     // Try WMIC on Windows
     #[cfg(target_os = "windows")]
     {
+        // Try wmic first
+        tracing::debug!("Trying wmic...");
         if let Ok(output) = std::process::Command::new("wmic")
             .args(["desktopmonitor", "get", "screenwidth,screenheight", "/format:value"])
             .output()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
+            tracing::debug!("wmic output: {}", stdout.trim());
             let mut w = 0u32;
             let mut h = 0u32;
             for line in stdout.lines() {
@@ -926,8 +937,34 @@ fn detect_screen_size() -> (u32, u32) {
                 }
             }
             if w > 0 && h > 0 {
+                tracing::info!("Detected screen via wmic: {w}x{h}");
                 return (w, h);
             }
+            tracing::warn!("wmic output did not contain resolution info");
+        } else {
+            tracing::warn!("wmic command failed");
+        }
+
+        // Fallback: try PowerShell with different approach
+        tracing::debug!("Trying PowerShell Get-CimInstance...");
+        if let Ok(output) = std::process::Command::new("powershell")
+            .args(["-Command", "(Get-CimInstance -ClassName Win32_VideoController).CurrentHorizontalResolution, (Get-CimInstance -ClassName Win32_VideoController).CurrentVerticalResolution"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            tracing::debug!("PowerShell output: {}", stdout.trim());
+            let parts: Vec<&str> = stdout.trim().split(',').collect();
+            if parts.len() == 2 {
+                if let (Ok(w), Ok(h)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>()) {
+                    if w > 0 && h > 0 {
+                        tracing::info!("Detected screen via PowerShell: {w}x{h}");
+                        return (w, h);
+                    }
+                }
+            }
+            tracing::warn!("PowerShell output did not contain resolution info");
+        } else {
+            tracing::warn!("PowerShell command failed");
         }
     }
 
