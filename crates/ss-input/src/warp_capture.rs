@@ -1,13 +1,14 @@
 //! rdev-based input capture with cursor warping for delta calculation.
 //!
-//! This approach uses rdev::listen (XRecord) for input capture and rdev::simulate (XTest)
+//! This approach uses rdev::grab (evdev grab) for input capture and rdev::simulate (XTest)
 //! for cursor warping. It doesn't require root permissions or udev rules.
 //!
 //! How it works:
-//! 1. Capture mouse events via rdev::listen (absolute coordinates)
+//! 1. Grab input devices via rdev::grab (intercept events before X Server)
 //! 2. When cursor hits right edge, warp it back to screen center
-//! 3. Calculate delta from center position
+//! 3. Calculate delta from the real position before warp
 //! 4. Forward delta to client
+//! 5. In remote mode, suppress events from reaching X Server (return None)
 //!
 //! This is the same approach used by Deskflow/Synergy/Barrier.
 
@@ -34,20 +35,17 @@ pub enum WarpInputEvent {
 pub struct WarpCaptureHandle {
     /// Receiver for captured input events.
     pub event_rx: mpsc::Receiver<WarpInputEvent>,
-    /// Flag to control whether events are processed.
-    /// When true: events are processed (LOCAL mode).
-    /// When false: events are suppressed (REMOTE mode).
-    pub enabled: Arc<AtomicBool>,
     /// Screen width for boundary detection.
     pub screen_width: u32,
     /// Screen height for boundary detection.
     pub screen_height: u32,
+    /// Whether we're in remote mode (cursor on client screen).
+    pub is_remote: Arc<AtomicBool>,
 }
 
 /// Shared state for the rdev callback.
 struct CallbackState {
     tx: mpsc::Sender<WarpInputEvent>,
-    enabled: Arc<AtomicBool>,
     screen_width: f64,
     screen_height: f64,
     /// Whether we're currently in a warp (to suppress the warp event itself)
@@ -63,14 +61,13 @@ struct CallbackState {
 ///
 /// Returns a handle with:
 /// - `event_rx`: receives captured input events (with deltas)
-/// - `enabled`: set to false to suppress event processing
 /// - `screen_width/height`: screen dimensions for boundary detection
+/// - `is_remote`: set to true when cursor is on client screen
 pub fn start_capture(
     screen_width: u32,
     screen_height: u32,
 ) -> anyhow::Result<WarpCaptureHandle> {
     let (tx, rx) = mpsc::channel::<WarpInputEvent>(256);
-    let enabled = Arc::new(AtomicBool::new(true));
     let is_warping = Arc::new(AtomicBool::new(false));
     let is_remote = Arc::new(AtomicBool::new(false));
     let last_x = Arc::new(Mutex::new((screen_width / 2) as f64));
@@ -78,7 +75,6 @@ pub fn start_capture(
 
     let state = CallbackState {
         tx: tx.clone(),
-        enabled: enabled.clone(),
         screen_width: screen_width as f64,
         screen_height: screen_height as f64,
         is_warping: is_warping.clone(),
@@ -89,23 +85,111 @@ pub fn start_capture(
 
     let state = Arc::new(Mutex::new(state));
 
-    // Spawn rdev listener in a separate thread
+    // Spawn rdev grab listener in a separate thread
     std::thread::spawn(move || {
         let callback_state = state.clone();
 
-        let callback = move |event: rdev::Event| {
+        let callback = move |event: rdev::Event| -> Option<rdev::Event> {
             let state = callback_state.lock().unwrap();
 
             // Check if we're warping (suppress the warp event itself)
             if state.is_warping.load(Ordering::Relaxed) {
-                return;
+                return Some(event); // Pass through warp events
             }
 
-            // Check if processing is enabled
-            if !state.enabled.load(Ordering::Relaxed) {
-                return;
+            // In remote mode, suppress ALL events from reaching X Server
+            if state.is_remote.load(Ordering::Relaxed) {
+                match event.event_type {
+                    EventType::MouseMove { x, y } => {
+                        let mut last_x = state.last_x.lock().unwrap();
+                        let mut last_y = state.last_y.lock().unwrap();
+
+                        // Calculate delta from last position
+                        let dx = x - *last_x;
+                        let dy = y - *last_y;
+
+                        // Check if cursor hit left edge (return to local)
+                        if x <= 0.0 {
+                            // Return to local mode
+                            state.is_remote.store(false, Ordering::Relaxed);
+
+                            // Send a special delta to indicate return to local
+                            let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
+                                dx: -1.0, // Special value to indicate return
+                                dy: 0.0,
+                            });
+
+                            tracing::debug!("Cursor returned to local screen");
+
+                            // Update last position
+                            *last_x = x;
+                            *last_y = y;
+
+                            // Suppress this event (don't let X Server see it)
+                            return None;
+                        }
+
+                        // Update last position
+                        *last_x = x;
+                        *last_y = y;
+
+                        // Send delta to client
+                        let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
+                            dx: dx as f32,
+                            dy: dy as f32,
+                        });
+
+                        // Suppress event from X Server
+                        return None;
+                    }
+                    EventType::ButtonPress(btn) => {
+                        if let Some(button) = map_button(btn) {
+                            let _ = state.tx.try_send(WarpInputEvent::MouseButton {
+                                button,
+                                pressed: true,
+                            });
+                        }
+                        // Suppress event from X Server
+                        return None;
+                    }
+                    EventType::ButtonRelease(btn) => {
+                        if let Some(button) = map_button(btn) {
+                            let _ = state.tx.try_send(WarpInputEvent::MouseButton {
+                                button,
+                                pressed: false,
+                            });
+                        }
+                        // Suppress event from X Server
+                        return None;
+                    }
+                    EventType::Wheel { delta_x, delta_y } => {
+                        let _ = state.tx.try_send(WarpInputEvent::Scroll {
+                            dx: delta_x as f32,
+                            dy: delta_y as f32,
+                        });
+                        // Suppress event from X Server
+                        return None;
+                    }
+                    EventType::KeyPress(key) => {
+                        let _ = state.tx.try_send(WarpInputEvent::KeyPress {
+                            keycode: key_to_u32(key),
+                            pressed: true,
+                        });
+                        // Suppress event from X Server
+                        return None;
+                    }
+                    EventType::KeyRelease(key) => {
+                        let _ = state.tx.try_send(WarpInputEvent::KeyPress {
+                            keycode: key_to_u32(key),
+                            pressed: false,
+                        });
+                        // Suppress event from X Server
+                        return None;
+                    }
+                }
             }
 
+            // Local mode - process events normally
             match event.event_type {
                 EventType::MouseMove { x, y } => {
                     let mut last_x = state.last_x.lock().unwrap();
@@ -120,6 +204,10 @@ pub fn start_capture(
                         // Warp cursor to center
                         let center_x = state.screen_width / 2.0;
                         let center_y = state.screen_height / 2.0;
+
+                        // Calculate delta BEFORE updating last position
+                        let edge_dx = x - *last_x;
+                        let edge_dy = y - *last_y;
 
                         // Set warping flag to suppress the warp event
                         state.is_warping.store(true, Ordering::Relaxed);
@@ -143,11 +231,7 @@ pub fn start_capture(
                             is_warping.store(false, Ordering::Relaxed);
                         });
 
-                        // Send delta (from last position to edge)
-                        // The delta should be the movement that caused the cursor to hit the edge
-                        let edge_dx = state.screen_width - 1.0 - *last_x;
-                        let edge_dy = y - *last_y;
-
+                        // Send delta (from real position to edge)
                         let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
                             dx: edge_dx as f32,
                             dy: edge_dy as f32,
@@ -159,30 +243,17 @@ pub fn start_capture(
                         tracing::debug!(
                             "Cursor warped: edge=({x:.0}, {y:.0}) center=({center_x:.0}, {center_y:.0}) delta=({edge_dx:.0}, {edge_dy:.0})"
                         );
-                    } else if x <= 0.0 && state.is_remote.load(Ordering::Relaxed) {
-                        // Cursor hit left edge while in remote mode - return to local
-                        state.is_remote.store(false, Ordering::Relaxed);
 
-                        // Send a special delta to indicate return to local
-                        let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
-                            dx: -1.0, // Special value to indicate return
-                            dy: 0.0,
-                        });
-
-                        tracing::debug!("Cursor returned to local screen");
-                    } else {
-                        // Normal movement - send delta
-                        *last_x = x;
-                        *last_y = y;
-
-                        // Only send delta if we're in remote mode
-                        if state.is_remote.load(Ordering::Relaxed) {
-                            let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
-                                dx: dx as f32,
-                                dy: dy as f32,
-                            });
-                        }
+                        // Suppress this event from X Server
+                        return None;
                     }
+
+                    // Normal movement - update last position
+                    *last_x = x;
+                    *last_y = y;
+
+                    // Pass through to X Server
+                    Some(event)
                 }
                 EventType::ButtonPress(btn) => {
                     if let Some(button) = map_button(btn) {
@@ -191,6 +262,8 @@ pub fn start_capture(
                             pressed: true,
                         });
                     }
+                    // Pass through to X Server
+                    Some(event)
                 }
                 EventType::ButtonRelease(btn) => {
                     if let Some(button) = map_button(btn) {
@@ -199,30 +272,38 @@ pub fn start_capture(
                             pressed: false,
                         });
                     }
+                    // Pass through to X Server
+                    Some(event)
                 }
                 EventType::Wheel { delta_x, delta_y } => {
                     let _ = state.tx.try_send(WarpInputEvent::Scroll {
                         dx: delta_x as f32,
                         dy: delta_y as f32,
                     });
+                    // Pass through to X Server
+                    Some(event)
                 }
                 EventType::KeyPress(key) => {
                     let _ = state.tx.try_send(WarpInputEvent::KeyPress {
                         keycode: key_to_u32(key),
                         pressed: true,
                     });
+                    // Pass through to X Server
+                    Some(event)
                 }
                 EventType::KeyRelease(key) => {
                     let _ = state.tx.try_send(WarpInputEvent::KeyPress {
                         keycode: key_to_u32(key),
                         pressed: false,
                     });
+                    // Pass through to X Server
+                    Some(event)
                 }
             }
         };
 
-        if let Err(e) = rdev::listen(callback) {
-            tracing::error!("rdev::listen failed: {:?}", e);
+        if let Err(e) = rdev::grab(callback) {
+            tracing::error!("rdev::grab failed: {:?}", e);
         }
     });
 
@@ -232,9 +313,9 @@ pub fn start_capture(
 
     Ok(WarpCaptureHandle {
         event_rx: rx,
-        enabled,
         screen_width,
         screen_height,
+        is_remote,
     })
 }
 

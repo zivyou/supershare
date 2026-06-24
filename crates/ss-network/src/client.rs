@@ -8,6 +8,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval, timeout, Duration};
 
 /// Client configuration
+#[derive(Clone)]
 pub struct ClientConfig {
     pub server_address: String,
     pub cert_path: PathBuf,

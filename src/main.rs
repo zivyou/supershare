@@ -189,7 +189,6 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                 let warp_capture = ss_input::warp_capture::start_capture(screen_w, screen_h)
                     .expect("Failed to start warp capture.");
                 let mut input_rx = warp_capture.event_rx;
-                let _warp_enabled = warp_capture.enabled;
 
                 // Start clipboard monitor
                 let monitor = ss_clipboard::monitor::ClipboardMonitor::new();
@@ -407,42 +406,50 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                 client_shutdown = Some(shutdown_tx);
 
                 tokio::spawn(async move {
-                    // Use connect() with timeout so errors are reported to GUI
-                    // (connect_with_retry would loop forever without feedback)
-                    let connect_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        ss_network::client::connect(config),
-                    ).await;
+                    let mut backoff = std::time::Duration::from_secs(1);
+                    let max_backoff = std::time::Duration::from_secs(30);
+                    let mut first_attempt = true;
 
-                    match connect_result {
-                        Ok(Ok(mut conn)) => {
-                            // Update state on successful connection
-                            {
-                                let mut s = state_clone.write().unwrap();
-                                s.client_connected = true;
-                                s.client_server_addr = Some(server_address.clone());
-                                s.server_screen_size = conn.server_screen;
-                                s.last_error = None;
-                            }
+                    loop {
+                        // Use connect() with timeout so errors are reported to GUI
+                        let connect_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            ss_network::client::connect(config.clone()),
+                        ).await;
 
-                            // --- Client in pure passive mode (no local input capture) ---
+                        match connect_result {
+                            Ok(Ok(mut conn)) => {
+                                // Reset backoff on successful connection
+                                backoff = std::time::Duration::from_secs(1);
+                                first_attempt = false;
 
-                            // Server screen dimensions (received during handshake)
-                            let server_screen = conn.server_screen.unwrap_or((1920, 1080));
-                            tracing::info!("Server screen: {}x{}", server_screen.0, server_screen.1);
+                                // Update state on successful connection
+                                {
+                                    let mut s = state_clone.write().unwrap();
+                                    s.client_connected = true;
+                                    s.client_server_addr = Some(server_address.clone());
+                                    s.server_screen_size = conn.server_screen;
+                                    s.last_error = None;
+                                }
 
-                            // Client virtual cursor (for receiving MouseDelta from server)
-                            let (screen_w, screen_h) = detect_screen_size();
-                            let virtual_cursor = Arc::new(Mutex::new(((screen_w / 2) as f32, (screen_h / 2) as f32)));
+                                // --- Client in pure passive mode (no local input capture) ---
 
-                            // Start clipboard monitor
-                            let monitor = ss_clipboard::monitor::ClipboardMonitor::new();
-                            let (mut clip_change_rx, clip_suppress_tx) = ss_clipboard::monitor::start_monitor(monitor);
+                                // Server screen dimensions (received during handshake)
+                                let server_screen = conn.server_screen.unwrap_or((1920, 1080));
+                                tracing::info!("Server screen: {}x{}", server_screen.0, server_screen.1);
 
-                            // Task: inject input events received from server (passive mode)
-                            let mut data_rx_inject = conn.data_rx.resubscribe();
-                            let virtual_cursor_inject = virtual_cursor.clone();
-                            tokio::spawn(async move {
+                                // Client virtual cursor (for receiving MouseDelta from server)
+                                let (screen_w, screen_h) = detect_screen_size();
+                                let virtual_cursor = Arc::new(Mutex::new(((screen_w / 2) as f32, (screen_h / 2) as f32)));
+
+                                // Start clipboard monitor
+                                let monitor = ss_clipboard::monitor::ClipboardMonitor::new();
+                                let (mut clip_change_rx, clip_suppress_tx) = ss_clipboard::monitor::start_monitor(monitor);
+
+                                // Task: inject input events received from server (passive mode)
+                                let mut data_rx_inject = conn.data_rx.resubscribe();
+                                let virtual_cursor_inject = virtual_cursor.clone();
+                                tokio::spawn(async move {
                                 let mut inject_count: u64 = 0;
                                 loop {
                                     match data_rx_inject.recv().await {
@@ -582,25 +589,56 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                                 }
                             }
 
-                            // Connection closed
-                            let mut s = state_clone.write().unwrap();
-                            s.client_connected = false;
-                            s.client_server_addr = None;
-                            s.server_screen_size = None;
+                            // Connection closed - attempt reconnect
+                            tracing::warn!("Connection lost, reconnecting in {} seconds...", backoff.as_secs());
+                            {
+                                let mut s = state_clone.write().unwrap();
+                                s.client_connected = false;
+                                s.last_error = Some(format!("Connection lost, reconnecting in {}s...", backoff.as_secs()));
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(max_backoff);
+                            continue; // Retry connection
                         }
                         Ok(Err(e)) => {
                             tracing::error!("Client connection error: {e}");
-                            let mut s = state_clone.write().unwrap();
-                            s.client_connected = false;
-                            s.last_error = Some(format!("Connection failed: {e}"));
+                            if first_attempt {
+                                // On first attempt, report error and don't retry
+                                let mut s = state_clone.write().unwrap();
+                                s.client_connected = false;
+                                s.last_error = Some(format!("Connection failed: {e}"));
+                                break;
+                            }
+                            // On subsequent attempts, retry with backoff
+                            tracing::warn!("Reconnecting in {} seconds...", backoff.as_secs());
+                            {
+                                let mut s = state_clone.write().unwrap();
+                                s.last_error = Some(format!("Reconnecting in {}s...", backoff.as_secs()));
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(max_backoff);
+                            continue;
                         }
                         Err(_) => {
                             tracing::error!("Client connection timed out");
-                            let mut s = state_clone.write().unwrap();
-                            s.client_connected = false;
-                            s.last_error = Some("Connection timed out (10s)".to_string());
+                            if first_attempt {
+                                let mut s = state_clone.write().unwrap();
+                                s.client_connected = false;
+                                s.last_error = Some("Connection timed out (10s)".to_string());
+                                break;
+                            }
+                            // On subsequent attempts, retry with backoff
+                            tracing::warn!("Reconnecting in {} seconds...", backoff.as_secs());
+                            {
+                                let mut s = state_clone.write().unwrap();
+                                s.last_error = Some(format!("Reconnecting in {}s...", backoff.as_secs()));
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(max_backoff);
+                            continue;
                         }
                     }
+                    } // end loop
                 });
 
                 // Update state optimistically
