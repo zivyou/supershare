@@ -48,8 +48,7 @@
 
 ## 7. 清理与测试
 
-- [ ] 7.1 删除或废弃 `capture.rs` 中的 `start_capture()` 函数（被 evdev_capture 替代）
+- [x] 7.1 更新 headless client 使用新架构（被动模式）
 - [x] 7.2 更新 `lib.rs` 导出：新增 `evdev_capture` 和 `virtual_cursor` 模块
 - [x] 7.3 为 VirtualCursor 编写单元测试
-- [ ] 7.4 为 evdev 事件解析编写单元测试
-- [ ] 7.5 端到端测试：Server 鼠标移动到边缘 → Client 光标移动 → Server 鼠标移回
+- [ ] 7.4 端到端测试：Server 鼠标移动到边缘 → Client 光标移动 → Server 鼠标移回

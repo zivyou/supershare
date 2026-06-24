@@ -730,51 +730,43 @@ async fn run_headless_client(
     let conn = ss_network::client::connect_with_retry(config).await?;
     tracing::info!("Connected. Press Ctrl+C to disconnect.");
 
-    // Suppressed flag: starts suppressed (cursor on server side)
-    let suppressed = Arc::new(Mutex::new(true));
-
-    // Start local input capture
-    let suppressed_clone = suppressed.clone();
-    let mut input_rx = ss_input::capture::start_capture(suppressed_clone);
+    // Client virtual cursor (for receiving MouseDelta from server)
+    let virtual_cursor = Arc::new(Mutex::new(((screen_w / 2) as f32, (screen_h / 2) as f32)));
 
     // Start clipboard monitor
     let monitor = ss_clipboard::monitor::ClipboardMonitor::new();
     let (mut clip_change_rx, clip_suppress_tx) = ss_clipboard::monitor::start_monitor(monitor);
 
-    // Task: forward captured input events to server, with boundary detection
-    let data_tx_input = conn.data_tx.clone();
-    let suppressed_input = suppressed.clone();
-    tokio::spawn(async move {
-        while let Some(event) = input_rx.recv().await {
-            // Check boundary: left edge = return to server
-            if let ss_input::capture::InputEvent::MouseMove { x, y: _ } = &event {
-                if *x as f32 <= 5.0 {
-                    tracing::info!("Client boundary: cursor at left edge (x={x:.0}), returning control");
-                    *suppressed_input.lock().unwrap() = true;
-                    let _ = data_tx_input.send(Message::BoundaryLeave { source_screen: 1 }).await;
-                    continue;
-                }
-            }
-            let msg = ss_input::capture::to_message(&event);
-            // Inject locally first — suppress capture briefly to prevent feedback loop
-            *suppressed_input.lock().unwrap() = true;
-            ss_input::inject::inject_event(&msg);
-            *suppressed_input.lock().unwrap() = false;
-            if data_tx_input.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Task: inject input events received from server
+    // Task: inject input events received from server (passive mode)
     let mut data_rx_inject = conn.data_rx.resubscribe();
+    let virtual_cursor_inject = virtual_cursor.clone();
     tokio::spawn(async move {
         loop {
             match data_rx_inject.recv().await {
                 Ok(msg) => {
                     match &msg {
-                        Message::MouseMove { .. }
-                        | Message::MouseButton { .. }
+                        Message::MouseDelta { dx, dy } => {
+                            // Apply delta to virtual cursor
+                            let (vx, vy) = {
+                                let mut vc = virtual_cursor_inject.lock().unwrap();
+                                vc.0 += dx;
+                                vc.1 += dy;
+                                vc.0 = vc.0.clamp(0.0, (screen_w - 1) as f32);
+                                vc.1 = vc.1.clamp(0.0, (screen_h - 1) as f32);
+                                (vc.0, vc.1)
+                            };
+                            let move_msg = Message::MouseMove { x: vx, y: vy };
+                            ss_input::inject::inject_event(&move_msg);
+                        }
+                        Message::MouseMove { x, y } => {
+                            {
+                                let mut vc = virtual_cursor_inject.lock().unwrap();
+                                vc.0 = *x;
+                                vc.1 = *y;
+                            }
+                            ss_input::inject::inject_event(&msg);
+                        }
+                        Message::MouseButton { .. }
                         | Message::MouseScroll { .. }
                         | Message::KeyPress { .. } => {
                             ss_input::inject::inject_event(&msg);
@@ -834,21 +826,25 @@ async fn run_headless_client(
         }
     });
 
-    // Task: listen for boundary events to toggle suppression
+    // Task: listen for boundary events
     let mut control_rx_boundary = conn.control_rx.resubscribe();
-    let suppressed_boundary = suppressed.clone();
+    let virtual_cursor_ctrl = virtual_cursor.clone();
     tokio::spawn(async move {
         loop {
             match control_rx_boundary.recv().await {
                 Ok(Message::BoundaryEnter { enter_x, enter_y, .. }) => {
-                    tracing::info!("Boundary enter at ({enter_x:.0}, {enter_y:.0}): enabling local input capture");
+                    tracing::info!("Boundary enter at ({enter_x:.0}, {enter_y:.0})");
+                    // Update virtual cursor position
+                    {
+                        let mut vc = virtual_cursor_ctrl.lock().unwrap();
+                        vc.0 = enter_x;
+                        vc.1 = enter_y;
+                    }
                     // Move cursor to enter position
                     ss_input::inject::inject_event(&Message::MouseMove { x: enter_x, y: enter_y });
-                    *suppressed_boundary.lock().unwrap() = false;
                 }
                 Ok(Message::BoundaryLeave { .. }) => {
-                    tracing::info!("Boundary leave: disabling local input capture");
-                    *suppressed_boundary.lock().unwrap() = true;
+                    tracing::info!("Boundary leave received");
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
