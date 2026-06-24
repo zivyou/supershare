@@ -17,6 +17,8 @@ pub struct ConnectedClient {
     pub name: String,
     pub control_tx: mpsc::Sender<Message>,
     pub data_tx: mpsc::Sender<Message>,
+    pub screen_width: u32,
+    pub screen_height: u32,
 }
 
 /// Shared server state
@@ -174,14 +176,14 @@ async fn handle_control_connection(
 ) -> anyhow::Result<()> {
     // Read handshake from client
     let msg = timeout(Duration::from_secs(10), read_frame(&mut tls_stream)).await??;
-    let client_name = match msg {
-        Some(Message::Handshake { version, name }) => {
+    let (client_name, client_screen_w, client_screen_h) = match msg {
+        Some(Message::Handshake { version, name, screen_width, screen_height }) => {
             if version != 1 {
                 write_frame(&mut tls_stream, &Message::Heartbeat).await?; // TODO: error message
                 anyhow::bail!("Unsupported protocol version: {version}");
             }
-            tracing::info!("Client handshake: {name}");
-            name
+            tracing::info!("Client handshake: {name} (screen: {screen_width}x{screen_height})");
+            (name, screen_width, screen_height)
         }
         _ => anyhow::bail!("Expected Handshake message, got {:?}", msg),
     };
@@ -212,6 +214,8 @@ async fn handle_control_connection(
                         name: client_name.clone(),
                         control_tx: ctrl_tx.clone(),
                         data_tx,
+                        screen_width: client_screen_w,
+                        screen_height: client_screen_h,
                     };
                     state.clients.write().await.insert(client_name.clone(), client);
                     break data_rx;
@@ -316,7 +320,7 @@ async fn handle_data_connection(
     // Read handshake from client
     let msg = timeout(Duration::from_secs(10), read_frame(&mut tls_stream)).await??;
     let client_name = match msg {
-        Some(Message::Handshake { version: _, name }) => {
+        Some(Message::Handshake { version: _, name, screen_width: _, screen_height: _ }) => {
             tracing::info!("Data channel handshake: {name}");
             name
         }

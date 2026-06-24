@@ -1,5 +1,3 @@
-use ss_core::protocol::BOUNDARY_ZONE_PX;
-
 /// Describes a screen in the global coordinate system
 #[derive(Debug, Clone)]
 pub struct ScreenInfo {
@@ -76,32 +74,6 @@ impl CoordinateSystem {
         self.screen_at_x(global_x).map(|s| s.id)
     }
 
-    /// Check if a mouse position is in the boundary zone (within BOUNDARY_ZONE_PX of an edge)
-    /// Returns Some((target_screen_id, enter_x, enter_y)) if crossing, None otherwise
-    pub fn check_boundary(&self, screen_id: u8, local_x: f32, local_y: f32) -> Option<(u8, f32, f32)> {
-        let screen = self.screens.iter().find(|s| s.id == screen_id)?;
-
-        // Check right edge
-        if local_x >= (screen.width as f32 - BOUNDARY_ZONE_PX as f32) {
-            // Find the screen to the right
-            let right_screen = self.screens.iter().find(|s| s.offset_x == screen.offset_x + screen.width)?;
-            // Enter past the boundary zone to avoid immediate bounce-back
-            return Some((right_screen.id, (BOUNDARY_ZONE_PX + 1) as f32, local_y));
-        }
-
-        // Check left edge
-        if local_x <= BOUNDARY_ZONE_PX as f32 {
-            // Find the screen to the left
-            let left_screen = self
-                .screens
-                .iter()
-                .find(|s| s.offset_x + s.width == screen.offset_x)?;
-            return Some((left_screen.id, left_screen.width as f32 - 1.0, local_y));
-        }
-
-        None
-    }
-
     /// Convert local screen coordinates to global coordinates
     pub fn local_to_global(&self, screen_id: u8, local_x: f32, local_y: f32) -> (f32, f32) {
         if let Some(screen) = self.screens.iter().find(|s| s.id == screen_id) {
@@ -144,40 +116,16 @@ mod tests {
     }
 
     #[test]
-    fn test_boundary_right_edge() {
+    fn test_screen_at_x() {
         let mut cs = CoordinateSystem::new(1920, 1080);
         cs.add_screen(1, "right".to_string(), 1920, 1080);
 
-        // Mouse at right edge of screen 0
-        let result = cs.check_boundary(0, 1918.0, 500.0);
-        assert!(result.is_some());
-        let (target, enter_x, enter_y) = result.unwrap();
-        assert_eq!(target, 1);
-        assert_eq!(enter_x, 6.0); // BOUNDARY_ZONE_PX + 1 to avoid bounce-back
-        assert_eq!(enter_y, 500.0);
-    }
+        // Server screen
+        assert_eq!(cs.screen_id_at_x(960.0), Some(0));
+        assert_eq!(cs.screen_id_at_x(1919.0), Some(0));
 
-    #[test]
-    fn test_boundary_left_edge() {
-        let mut cs = CoordinateSystem::new(1920, 1080);
-        cs.add_screen(1, "right".to_string(), 1920, 1080);
-
-        // Mouse at left edge of screen 1
-        let result = cs.check_boundary(1, 2.0, 500.0);
-        assert!(result.is_some());
-        let (target, enter_x, enter_y) = result.unwrap();
-        assert_eq!(target, 0);
-        assert_eq!(enter_x, 1919.0);
-        assert_eq!(enter_y, 500.0);
-    }
-
-    #[test]
-    fn test_no_boundary() {
-        let mut cs = CoordinateSystem::new(1920, 1080);
-        cs.add_screen(1, "right".to_string(), 1920, 1080);
-
-        // Mouse in middle of screen
-        let result = cs.check_boundary(0, 960.0, 500.0);
-        assert!(result.is_none());
+        // Client screen
+        assert_eq!(cs.screen_id_at_x(1920.0), Some(1));
+        assert_eq!(cs.screen_id_at_x(3839.0), Some(1));
     }
 }

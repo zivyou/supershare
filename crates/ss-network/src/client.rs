@@ -14,6 +14,8 @@ pub struct ClientConfig {
     pub key_path: PathBuf,
     pub ca_path: PathBuf,
     pub device_name: String,
+    pub screen_width: u32,
+    pub screen_height: u32,
 }
 
 /// Connection state for a client
@@ -56,6 +58,8 @@ pub async fn connect(config: ClientConfig) -> anyhow::Result<ClientConnection> {
         &Message::Handshake {
             version: 1,
             name: config.device_name.clone(),
+            screen_width: config.screen_width,
+            screen_height: config.screen_height,
         },
     )
     .await?;
@@ -142,6 +146,8 @@ pub async fn connect(config: ClientConfig) -> anyhow::Result<ClientConnection> {
         &Message::Handshake {
             version: 1,
             name: config.device_name.clone(),
+            screen_width: config.screen_width,
+            screen_height: config.screen_height,
         },
     )
     .await?;
@@ -203,6 +209,8 @@ pub async fn connect_with_retry(config: ClientConfig) -> anyhow::Result<ClientCo
             key_path: config.key_path.clone(),
             ca_path: config.ca_path.clone(),
             device_name: config.device_name.clone(),
+            screen_width: config.screen_width,
+            screen_height: config.screen_height,
         })
         .await
         {

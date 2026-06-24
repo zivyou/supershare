@@ -12,4 +12,4 @@ anyhow.workspace = true
 blake3.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-evdev = "0.12"
+evdev = { version = "0.12", features = ["tokio"] }

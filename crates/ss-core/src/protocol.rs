@@ -44,6 +44,7 @@ pub enum MessageType {
     ScreenConfig = 0x0B,
     BoundaryEnter = 0x0C,
     BoundaryLeave = 0x0D,
+    MouseDelta = 0x0E,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -64,6 +65,7 @@ impl TryFrom<u8> for MessageType {
             0x0B => Ok(Self::ScreenConfig),
             0x0C => Ok(Self::BoundaryEnter),
             0x0D => Ok(Self::BoundaryLeave),
+            0x0E => Ok(Self::MouseDelta),
             _ => anyhow::bail!("Unknown message type: 0x{:02X}", value),
         }
     }
@@ -91,6 +93,9 @@ pub enum ClipboardFormat {
 pub enum Message {
     /// Mouse movement: absolute position (x, y) on the global coordinate system
     MouseMove { x: f32, y: f32 },
+
+    /// Mouse movement: relative delta (dx, dy) from evdev
+    MouseDelta { dx: f32, dy: f32 },
 
     /// Mouse button press/release
     MouseButton { button: Button, pressed: bool },
@@ -121,10 +126,12 @@ pub enum Message {
     /// End of clipboard transfer, with hash for verification
     ClipboardEnd { hash: [u8; 32] },
 
-    /// Client handshake: protocol version + device name
+    /// Client handshake: protocol version + device name + screen dimensions
     Handshake {
         version: u8,
         name: String,
+        screen_width: u32,
+        screen_height: u32,
     },
 
     /// Heartbeat (keep-alive)
@@ -154,6 +161,7 @@ impl Message {
     pub fn msg_type(&self) -> MessageType {
         match self {
             Message::MouseMove { .. } => MessageType::MouseMove,
+            Message::MouseDelta { .. } => MessageType::MouseDelta,
             Message::MouseButton { .. } => MessageType::MouseButton,
             Message::MouseScroll { .. } => MessageType::MouseScroll,
             Message::KeyPress { .. } => MessageType::KeyPress,
