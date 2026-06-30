@@ -767,17 +767,23 @@ fn spawn_client_connection(
                             let virtual_cursor_ctrl = virtual_cursor.clone();
                             loop {
                                 match conn.control_rx.recv().await {
-                                    Ok(Message::BoundaryEnter { enter_x, enter_y, target_screen }) => {
-                                        tracing::info!("*** CLIENT BoundaryEnter: screen={target_screen} pos=({enter_x:.0}, {enter_y:.0}) ***");
+                                    Ok(Message::BoundaryEnter { enter_x, enter_y: _, target_screen }) => {
+                                        // ==============================================
+                                        // Fix: Standardize Y coordinate to Client screen center
+                                        // This ensures cursor always starts at vertical center,
+                                        // regardless of where it entered from on the Server
+                                        // ==============================================
+                                        let client_center_y = (screen_h / 2) as f32;
+                                        tracing::info!("*** CLIENT BoundaryEnter: screen={target_screen} pos=({enter_x:.0}, {client_center_y:.0}) ***");
                                         // Move cursor to the enter position using inject
                                         {
                                             let mut vc = virtual_cursor_ctrl.lock().unwrap();
                                             vc.0 = enter_x;
-                                            vc.1 = enter_y;
+                                            vc.1 = client_center_y;
                                         }
-                                        let move_msg = Message::MouseMove { x: enter_x, y: enter_y };
+                                        let move_msg = Message::MouseMove { x: enter_x, y: client_center_y };
                                         ss_input::inject::inject_event(&move_msg);
-                                        tracing::info!("Injected MouseMove to ({enter_x:.0}, {enter_y:.0})");
+                                        tracing::info!("Injected MouseMove to ({enter_x:.0}, {client_center_y:.0})");
                                     }
                                     Ok(Message::BoundaryLeave { .. }) => {
                                         tracing::info!("Boundary leave received (no action needed in passive mode)");
@@ -1211,16 +1217,20 @@ async fn run_headless_client(
     tokio::spawn(async move {
         loop {
             match control_rx_boundary.recv().await {
-                Ok(Message::BoundaryEnter { enter_x, enter_y, .. }) => {
-                    tracing::info!("Boundary enter at ({enter_x:.0}, {enter_y:.0})");
+                Ok(Message::BoundaryEnter { enter_x, enter_y: _, .. }) => {
+                    // ==============================================
+                    // Fix: Standardize Y coordinate to Client screen center
+                    // ==============================================
+                    let client_center_y = (screen_h / 2) as f32;
+                    tracing::info!("Boundary enter at ({enter_x:.0}, {client_center_y:.0})");
                     // Update virtual cursor position
                     {
                         let mut vc = virtual_cursor_ctrl.lock().unwrap();
                         vc.0 = enter_x;
-                        vc.1 = enter_y;
+                        vc.1 = client_center_y;
                     }
                     // Move cursor to enter position
-                    ss_input::inject::inject_event(&Message::MouseMove { x: enter_x, y: enter_y });
+                    ss_input::inject::inject_event(&Message::MouseMove { x: enter_x, y: client_center_y });
                 }
                 Ok(Message::BoundaryLeave { .. }) => {
                     tracing::info!("Boundary leave received");

@@ -131,11 +131,72 @@ pub fn start_capture(
                             return None;
                         }
 
-                        // Update last position
+                        // ==============================================
+                        // Fix: Detect top/bottom/right edges in remote mode
+                        // Warp silently and only send delta - no boundary events!
+                        // ==============================================
+                        let hit_top = y <= 0.0;
+                        let hit_bottom = y >= state.screen_height - 1.0;
+                        let hit_right = x >= state.screen_width - 1.0;
+
+                        if hit_top || hit_bottom || hit_right {
+                            // Calculate wrap-around position
+                            let new_y = if hit_top {
+                                state.screen_height - 2.0  // warp to just above bottom
+                            } else if hit_bottom {
+                                1.0  // warp to just below top
+                            } else {
+                                y  // Y direction unchanged
+                            };
+
+                            let new_x = if hit_right {
+                                state.screen_width / 2.0  // warp to horizontal center
+                            } else {
+                                x  // X direction unchanged
+                            };
+
+                            // Set warping flag to suppress the warp event itself
+                            state.is_warping.store(true, Ordering::Relaxed);
+
+                            // Warp cursor to the new position
+                            if let Err(e) = rdev::simulate(&EventType::MouseMove {
+                                x: new_x,
+                                y: new_y,
+                            }) {
+                                tracing::warn!("Failed to warp cursor in remote mode: {:?}", e);
+                            }
+
+                            // Update last position to the warped position
+                            *last_x = new_x;
+                            *last_y = new_y;
+
+                            // Clear warping flag after a small delay
+                            let is_warping = state.is_warping.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                is_warping.store(false, Ordering::Relaxed);
+                            });
+
+                            // Send delta (use the original delta, NOT the warp delta!)
+                            let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
+                                dx: dx as f32,
+                                dy: dy as f32,
+                            });
+
+                            tracing::debug!(
+                                "Remote mode warp: hit={}, pos=({:.0}, {:.0}) warp_to=({:.0}, {:.0})",
+                                if hit_top { "top" } else if hit_bottom { "bottom" } else { "right" },
+                                x, y, new_x, new_y
+                            );
+
+                            // Suppress this event from X Server
+                            return None;
+                        }
+
+                        // Normal movement in remote mode
                         *last_x = x;
                         *last_y = y;
 
-                        // Send delta to client
                         let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
                             dx: dx as f32,
                             dy: dy as f32,
@@ -207,9 +268,20 @@ pub fn start_capture(
                         let center_x = state.screen_width / 2.0;
                         let center_y = state.screen_height / 2.0;
 
-                        // Calculate delta BEFORE updating last position
-                        let edge_dx = x - *last_x;
-                        let edge_dy = y - *last_y;
+                        // ==============================================
+                        // Fix: Set is_remote FIRST, send BoundaryEnter FIRST
+                        // Do NOT send edge_dx delta - BoundaryEnter sets the correct position
+                        // ==============================================
+
+                        // Mark as remote FIRST (before any event sending)
+                        state.is_remote.store(true, Ordering::Relaxed);
+
+                        // Send BoundaryEnter FIRST - this tells the client to position
+                        // the cursor at the left edge
+                        let _ = state.tx.try_send(WarpInputEvent::BoundaryEnter {
+                            enter_x: 6.0,  // BOUNDARY_ZONE_PX + 1
+                            enter_y: y as f32,
+                        });
 
                         // Set warping flag to suppress the warp event
                         state.is_warping.store(true, Ordering::Relaxed);
@@ -233,25 +305,13 @@ pub fn start_capture(
                             is_warping.store(false, Ordering::Relaxed);
                         });
 
-                        // Send delta (from real position to edge)
-                        let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
-                            dx: edge_dx as f32,
-                            dy: edge_dy as f32,
-                        });
-
-                        // Mark as remote
-                        state.is_remote.store(true, Ordering::Relaxed);
+                        // Note: Do NOT send edge_dx MouseDelta!
+                        // BoundaryEnter already sets the correct initial position.
+                        // Sending delta would cause double-movement.
 
                         tracing::debug!(
-                            "Cursor warped: edge=({x:.0}, {y:.0}) center=({center_x:.0}, {center_y:.0}) delta=({edge_dx:.0}, {edge_dy:.0})"
+                            "Cursor warped into remote mode: edge=({x:.0}, {y:.0}) center=({center_x:.0}, {center_y:.0})"
                         );
-
-                        // Send BoundaryEnter event (enter_x = BOUNDARY_ZONE_PX + 1 = 6)
-                        // This tells the client to position the cursor at the left edge
-                        let _ = state.tx.try_send(WarpInputEvent::BoundaryEnter {
-                            enter_x: 6.0,
-                            enter_y: y as f32,
-                        });
 
                         // Suppress this event from X Server
                         return None;
