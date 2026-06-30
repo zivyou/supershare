@@ -245,7 +245,7 @@ async fn handle_control_connection(
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Message>(128);
 
     // Wait for the data channel to arrive
-    let data_rx = {
+    let _data_rx = {
         let mut attempts = 0;
         loop {
             {

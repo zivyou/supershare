@@ -1,6 +1,6 @@
 use eframe::egui;
 use ss_core::config::AppConfig;
-use crate::state::{AppCommand, ClientInfo, CommandSender, SharedState, SharedAppState};
+use crate::state::{AppCommand, CommandSender, SharedState};
 
 /// Tab selection for the configuration UI
 #[derive(PartialEq)]

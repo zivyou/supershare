@@ -1,8 +1,7 @@
 use crate::framing::{read_frame, write_frame};
 use crate::tls;
-use ss_core::protocol::{Message, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TIMEOUT_SECS};
+use ss_core::protocol::{Message, HEARTBEAT_INTERVAL_SECS};
 use std::path::PathBuf;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval, timeout, Duration};

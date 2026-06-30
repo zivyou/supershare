@@ -2,7 +2,6 @@ use arboard::Clipboard;
 use ss_core::protocol::{
     ClipboardContent, CLIPBOARD_POLL_INTERVAL_MS, CLIPBOARD_SUPPRESSION_MS,
 };
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task;

@@ -196,8 +196,8 @@ pub fn start_capture(
                     let mut last_y = state.last_y.lock().unwrap();
 
                     // Calculate delta from last position
-                    let dx = x - *last_x;
-                    let dy = y - *last_y;
+                    let _dx = x - *last_x;
+                    let _dy = y - *last_y;
 
                     // Check if cursor hit right edge
                     if x >= state.screen_width - 1.0 {

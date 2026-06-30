@@ -1,7 +1,6 @@
 use ss_core::protocol::{
     ClipboardContent, ClipboardFormat, Message, CLIPBOARD_CHUNK_SIZE, MAX_CLIPBOARD_IMAGE_SIZE,
 };
-use tokio::sync::mpsc;
 
 /// Compress image data with zstd
 pub fn compress_image(rgba: &[u8]) -> anyhow::Result<Vec<u8>> {
