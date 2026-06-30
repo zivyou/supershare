@@ -219,6 +219,20 @@ async fn command_handler(
                 tokio::spawn(async move {
                     while let Some(event) = input_rx.recv().await {
                         match &event {
+                            ss_input::warp_capture::WarpInputEvent::BoundaryEnter { enter_x, enter_y } => {
+                                tracing::info!("*** BOUNDARY ENTER: sending to client pos=({enter_x:.0}, {enter_y:.0}) ***");
+                                let msg = Message::BoundaryEnter {
+                                    enter_x: *enter_x,
+                                    enter_y: *enter_y,
+                                    target_screen: 1,
+                                };
+                                let clients = server_state_input.clients.read().await;
+                                for (name, client) in clients.iter() {
+                                    if let Err(e) = client.control_tx.send(msg.clone()).await {
+                                        tracing::warn!("Failed to send BoundaryEnter to {name}: {e}");
+                                    }
+                                }
+                            }
                             ss_input::warp_capture::WarpInputEvent::MouseDelta { dx, dy } => {
                                 move_count += 1;
 

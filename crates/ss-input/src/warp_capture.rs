@@ -29,6 +29,8 @@ pub enum WarpInputEvent {
     KeyPress { keycode: u32, pressed: bool },
     /// Scroll wheel
     Scroll { dx: f32, dy: f32 },
+    /// Cursor crossed into a client screen
+    BoundaryEnter { enter_x: f32, enter_y: f32 },
 }
 
 /// Handle to the warp capture system.
@@ -244,6 +246,13 @@ pub fn start_capture(
                             "Cursor warped: edge=({x:.0}, {y:.0}) center=({center_x:.0}, {center_y:.0}) delta=({edge_dx:.0}, {edge_dy:.0})"
                         );
 
+                        // Send BoundaryEnter event (enter_x = BOUNDARY_ZONE_PX + 1 = 6)
+                        // This tells the client to position the cursor at the left edge
+                        let _ = state.tx.try_send(WarpInputEvent::BoundaryEnter {
+                            enter_x: 6.0,
+                            enter_y: y as f32,
+                        });
+
                         // Suppress this event from X Server
                         return None;
                     }
@@ -362,6 +371,13 @@ pub fn to_message(event: &WarpInputEvent) -> ss_core::protocol::Message {
             ss_core::protocol::Message::MouseScroll {
                 dx: *dx,
                 dy: *dy,
+            }
+        }
+        WarpInputEvent::BoundaryEnter { enter_x, enter_y } => {
+            ss_core::protocol::Message::BoundaryEnter {
+                enter_x: *enter_x,
+                enter_y: *enter_y,
+                target_screen: 1,
             }
         }
     }
