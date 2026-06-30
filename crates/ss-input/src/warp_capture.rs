@@ -43,6 +43,8 @@ pub struct WarpCaptureHandle {
     pub screen_height: u32,
     /// Whether we're in remote mode (cursor on client screen).
     pub is_remote: Arc<AtomicBool>,
+    /// External signal to exit remote mode (set to true to exit).
+    pub exit_remote: Arc<AtomicBool>,
 }
 
 /// Shared state for the rdev callback.
@@ -57,6 +59,8 @@ struct CallbackState {
     last_y: Arc<Mutex<f64>>,
     /// Whether we're in remote mode (cursor on client screen)
     is_remote: Arc<AtomicBool>,
+    /// External signal to exit remote mode.
+    exit_remote: Arc<AtomicBool>,
 }
 
 /// Start capturing input events with cursor warping.
@@ -72,6 +76,7 @@ pub fn start_capture(
     let (tx, rx) = mpsc::channel::<WarpInputEvent>(256);
     let is_warping = Arc::new(AtomicBool::new(false));
     let is_remote = Arc::new(AtomicBool::new(false));
+    let exit_remote = Arc::new(AtomicBool::new(false));
     let last_x = Arc::new(Mutex::new((screen_width / 2) as f64));
     let last_y = Arc::new(Mutex::new((screen_height / 2) as f64));
 
@@ -83,6 +88,7 @@ pub fn start_capture(
         last_x: last_x.clone(),
         last_y: last_y.clone(),
         is_remote: is_remote.clone(),
+        exit_remote: exit_remote.clone(),
     };
 
     let state = Arc::new(Mutex::new(state));
@@ -99,6 +105,13 @@ pub fn start_capture(
                 return Some(event); // Pass through warp events
             }
 
+            // Check for external signal to exit remote mode
+            if state.exit_remote.load(Ordering::Relaxed) {
+                state.is_remote.store(false, Ordering::Relaxed);
+                state.exit_remote.store(false, Ordering::Relaxed);
+                tracing::debug!("Exiting remote mode via external signal");
+            }
+
             // In remote mode, suppress ALL events from reaching X Server
             if state.is_remote.load(Ordering::Relaxed) {
                 match event.event_type {
@@ -110,36 +123,16 @@ pub fn start_capture(
                         let dx = x - *last_x;
                         let dy = y - *last_y;
 
-                        // Check if cursor hit left edge (return to local)
-                        if x <= 0.0 {
-                            // Return to local mode
-                            state.is_remote.store(false, Ordering::Relaxed);
-
-                            // Send a special delta to indicate return to local
-                            let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
-                                dx: -1.0, // Special value to indicate return
-                                dy: 0.0,
-                            });
-
-                            tracing::debug!("Cursor returned to local screen");
-
-                            // Update last position
-                            *last_x = x;
-                            *last_y = y;
-
-                            // Suppress this event (don't let X Server see it)
-                            return None;
-                        }
-
                         // ==============================================
-                        // Fix: Detect top/bottom/right edges in remote mode
-                        // Warp silently and only send delta - no boundary events!
+                        // Fix: Detect ALL four edges in remote mode
+                        // ALL edges warp silently - Client decides when to return!
                         // ==============================================
+                        let hit_left = x <= 0.0;
                         let hit_top = y <= 0.0;
                         let hit_bottom = y >= state.screen_height - 1.0;
                         let hit_right = x >= state.screen_width - 1.0;
 
-                        if hit_top || hit_bottom || hit_right {
+                        if hit_left || hit_top || hit_bottom || hit_right {
                             // Calculate wrap-around position
                             let new_y = if hit_top {
                                 state.screen_height - 2.0  // warp to just above bottom
@@ -149,7 +142,9 @@ pub fn start_capture(
                                 y  // Y direction unchanged
                             };
 
-                            let new_x = if hit_right {
+                            let new_x = if hit_left {
+                                state.screen_width - 2.0  // warp to just inside right edge
+                            } else if hit_right {
                                 state.screen_width / 2.0  // warp to horizontal center
                             } else {
                                 x  // X direction unchanged
@@ -185,7 +180,8 @@ pub fn start_capture(
 
                             tracing::debug!(
                                 "Remote mode warp: hit={}, pos=({:.0}, {:.0}) warp_to=({:.0}, {:.0})",
-                                if hit_top { "top" } else if hit_bottom { "bottom" } else { "right" },
+                                if hit_left { "left" } else if hit_top { "top" }
+                                else if hit_bottom { "bottom" } else { "right" },
                                 x, y, new_x, new_y
                             );
 
@@ -385,6 +381,7 @@ pub fn start_capture(
         screen_width,
         screen_height,
         is_remote,
+        exit_remote,
     })
 }
 

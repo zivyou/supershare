@@ -284,12 +284,21 @@ async fn command_handler(
                 // Task: receive messages from clients (via broadcast channel)
                 let mut broadcast_rx = server_state.broadcast_rx.subscribe();
                 let clip_suppress_server = clip_suppress_tx.clone();
+                let exit_remote_signal = warp_capture.exit_remote.clone();
                 tokio::spawn(async move {
                     let mut reassembler: Option<ss_clipboard::sync::ClipboardReassembler> = None;
                     loop {
                         match broadcast_rx.recv().await {
                             Ok((client_name, msg)) => {
                                 match &msg {
+                                    // ==============================================
+                                    // Fix: Handle boundary return request from client
+                                    // ==============================================
+                                    Message::MouseDelta { dx: -3.0, dy: 0.0 } => {
+                                        tracing::info!("*** BOUNDARY RETURN REQUEST from {client_name} ***");
+                                        // Signal warp_capture to exit remote mode
+                                        exit_remote_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     // Input events from client: no longer expected in new architecture
                                     // (server handles all input via evdev, client is passive)
                                     Message::MouseMove { .. }
@@ -655,6 +664,7 @@ fn spawn_client_connection(
 
                                 // Task: inject input events received from server (passive mode)
                                 let mut data_rx_inject = conn.data_rx.resubscribe();
+                                let data_tx_inject = conn.data_tx.clone();  // Clone before move!
                                 let virtual_cursor_inject = virtual_cursor.clone();
                                 tokio::spawn(async move {
                                 let mut inject_count: u64 = 0;
@@ -665,14 +675,26 @@ fn spawn_client_connection(
                                                 Message::MouseDelta { dx, dy } => {
                                                     inject_count += 1;
                                                     // Apply delta to virtual cursor
-                                                    let (vx, vy) = {
+                                                    let (vx, vy, hit_left) = {
                                                         let mut vc = virtual_cursor_inject.lock().unwrap();
                                                         vc.0 += dx;
                                                         vc.1 += dy;
-                                                        // Clamp to screen bounds
-                                                        vc.0 = vc.0.clamp(0.0, (screen_w - 1) as f32);
+
+                                                        // ==============================================
+                                                        // Fix: Detect client left boundary and request return
+                                                        // ==============================================
+                                                        let hit_left = vc.0 <= 0.0;
+
+                                                        // If returning, clamp to exactly 0 (for clean injection)
+                                                        // Otherwise clamp normally
+                                                        if hit_left {
+                                                            vc.0 = 0.0;
+                                                        } else {
+                                                            vc.0 = vc.0.clamp(0.0, (screen_w - 1) as f32);
+                                                        }
                                                         vc.1 = vc.1.clamp(0.0, (screen_h - 1) as f32);
-                                                        (vc.0, vc.1)
+
+                                                        (vc.0, vc.1, hit_left)
                                                     };
                                                     if inject_count % 50 == 1 {
                                                         tracing::info!("Injecting MouseMove ({:.0}, {:.0}) [delta={dx:.0},{dy:.0}]", vx, vy);
@@ -680,6 +702,18 @@ fn spawn_client_connection(
                                                     // Inject absolute position
                                                     let move_msg = Message::MouseMove { x: vx, y: vy };
                                                     ss_input::inject::inject_event(&move_msg);
+
+                                                    // ==============================================
+                                                    // If hit left edge, request return to Server
+                                                    // ==============================================
+                                                    if hit_left {
+                                                        tracing::info!("*** CLIENT LEFT BOUNDARY: sending return signal ***");
+                                                        // Send special delta = -3.0 to signal return request
+                                                        let return_msg = Message::MouseDelta { dx: -3.0, dy: 0.0 };
+                                                        if let Err(e) = data_tx_inject.send(return_msg).await {
+                                                            tracing::warn!("Failed to send boundary return request: {e}");
+                                                        }
+                                                    }
                                                 }
                                                 Message::MouseMove { x, y } => {
                                                     inject_count += 1;
@@ -1124,6 +1158,7 @@ async fn run_headless_client(
 
     // Task: inject input events received from server (passive mode)
     let mut data_rx_inject = conn.data_rx.resubscribe();
+    let data_tx_inject = conn.data_tx.clone();
     let virtual_cursor_inject = virtual_cursor.clone();
     tokio::spawn(async move {
         loop {
@@ -1132,16 +1167,34 @@ async fn run_headless_client(
                     match &msg {
                         Message::MouseDelta { dx, dy } => {
                             // Apply delta to virtual cursor
-                            let (vx, vy) = {
+                            let (vx, vy, hit_left) = {
                                 let mut vc = virtual_cursor_inject.lock().unwrap();
                                 vc.0 += dx;
                                 vc.1 += dy;
-                                vc.0 = vc.0.clamp(0.0, (screen_w - 1) as f32);
+
+                                // Detect client left boundary and request return
+                                let hit_left = vc.0 <= 0.0;
+
+                                if hit_left {
+                                    vc.0 = 0.0;
+                                } else {
+                                    vc.0 = vc.0.clamp(0.0, (screen_w - 1) as f32);
+                                }
                                 vc.1 = vc.1.clamp(0.0, (screen_h - 1) as f32);
-                                (vc.0, vc.1)
+
+                                (vc.0, vc.1, hit_left)
                             };
                             let move_msg = Message::MouseMove { x: vx, y: vy };
                             ss_input::inject::inject_event(&move_msg);
+
+                            // If hit left edge, request return to Server
+                            if hit_left {
+                                tracing::info!("*** CLIENT LEFT BOUNDARY: sending return signal ***");
+                                let return_msg = Message::MouseDelta { dx: -3.0, dy: 0.0 };
+                                if let Err(e) = data_tx_inject.send(return_msg).await {
+                                    tracing::warn!("Failed to send boundary return request: {e}");
+                                }
+                            }
                         }
                         Message::MouseMove { x, y } => {
                             {
