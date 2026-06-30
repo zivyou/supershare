@@ -56,6 +56,23 @@ pub struct ServerConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
     pub ca_path: PathBuf,
+    /// Optional pairing support. When set, a pairing listener is started and
+    /// successful pairings are reported via the channel.
+    pub pairing: Option<PairingSupport>,
+}
+
+/// Parameters for enabling the pairing listener alongside the server.
+pub struct PairingSupport {
+    /// Pairing listener port (default control_port - 1).
+    pub pairing_port: u16,
+    /// CA certificate PEM (used to sign client certs).
+    pub ca_cert_pem: String,
+    /// CA private key PEM.
+    pub ca_key_pem: String,
+    /// Shared PIN manager (so the GUI can read the current PIN).
+    pub pin_manager: Arc<crate::pairing::server::PinManager>,
+    /// Channel that receives a record for each successful pairing.
+    pub on_paired: mpsc::Sender<ss_core::config::PairedClient>,
 }
 
 /// Start the server with control and data channel listeners
@@ -161,6 +178,32 @@ pub async fn start(
             }
         }
     });
+
+    // Spawn pairing listener if pairing support is enabled.
+    if let Some(pairing) = config.pairing {
+        let pairing_config = crate::pairing::server::PairingServerConfig {
+            pairing_port: pairing.pairing_port,
+            ca_cert_pem: pairing.ca_cert_pem,
+            ca_key_pem: pairing.ca_key_pem,
+        };
+        let pin_manager = pairing.pin_manager;
+        let on_paired = pairing.on_paired;
+        let notify_tx = state.notify_tx.clone();
+        let shutdown_pairing = shutdown.resubscribe();
+        tokio::spawn(async move {
+            if let Err(e) = crate::pairing::server::run_pairing_listener(
+                pairing_config,
+                pin_manager,
+                on_paired,
+                notify_tx,
+                shutdown_pairing,
+            )
+            .await
+            {
+                tracing::error!("Pairing listener error: {e}");
+            }
+        });
+    }
 
     // Wait for shutdown signal
     let _ = shutdown.recv().await;

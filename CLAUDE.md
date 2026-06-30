@@ -48,11 +48,22 @@ No linter config; use `cargo clippy` if available. No CI config found.
 - `AppCommand` via `mpsc::channel` — GUI sends commands, runtime executes
 - **Never hold RwLock across .await** — use block scopes to drop guards before async ops
 
-### TLS Certificate Chain
+### Trust establishment: pairing (default) and manual certs (advanced)
+
+**Pairing (default, recommended).** The Server is its own CA: on first run it auto-generates `ca.pem`/`server.pem` under the config dir's `trust/` folder — no manual `gen-cert` needed. A Client connects with only the Server IP; it then pairs:
+
+1. Server displays a 6-digit PIN (GUI) or prints it (`--server`, unless `--no-pairing`).
+2. Client enters the PIN (GUI prompt, or `--client --connect <ip> --pair` reads it from stdin).
+3. SPAKE2 (PAKE) over a dedicated pairing port (default `control_port − 1`) authenticates the channel with the PIN — a LAN MITM without the PIN cannot intercept. The Server signs the Client's CSR and returns the cert + CA, AEAD-encrypted.
+4. Both persist trust (`ServerConfig.paired_clients`, `ClientConfig.known_servers`); reconnects need no PIN and reuse the existing mTLS path unchanged.
+
+Pairing code: `ss-network/src/pairing/{crypto,server,client}.rs`; CA ops in `ss-network/src/cert.rs`; PIN lifecycle (6-digit, TTL rotation, rotate-after-success, lockout) in `pairing::server::PinManager`.
+
+**Manual certs (advanced).** Still supported and take precedence when explicit cert paths are set:
 
 1. Generate CA: `supershare --gen-cert --output ./certs`
 2. Generate device certs signed by CA: `supershare --gen-cert --device name --ca-cert ca.pem --ca-key ca-key.pem --ip <server-ip>`
-3. Server and client both present their device cert and verify the peer's cert against the CA
+3. Pass `--cert/--key/--ca` (all three) to skip pairing entirely.
 
 ## Critical Design Constraints
 

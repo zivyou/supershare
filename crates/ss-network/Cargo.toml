@@ -10,5 +10,14 @@ tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 bincode.workspace = true
+serde.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+rcgen.workspace = true
+# Pairing: PAKE + AEAD + KDF
+spake2 = "0.4"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+thiserror = "1"

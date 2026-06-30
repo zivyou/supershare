@@ -44,6 +44,14 @@ struct Cli {
     #[arg(long, default_value = "")]
     name: String,
 
+    /// Pair with the server using a PIN (client mode, prompts on stdin)
+    #[arg(long)]
+    pair: bool,
+
+    /// Disable PIN-based pairing (server mode)
+    #[arg(long)]
+    no_pairing: bool,
+
     /// Generate certificates
     #[arg(long)]
     gen_cert: bool,
@@ -86,19 +94,19 @@ fn main() -> anyhow::Result<()> {
 
     // Headless server mode
     if cli.server {
-        let cert = cli.cert.ok_or_else(|| anyhow::anyhow!("--cert is required"))?;
-        let key = cli.key.ok_or_else(|| anyhow::anyhow!("--key is required"))?;
-        let ca = cli.ca.ok_or_else(|| anyhow::anyhow!("--ca is required"))?;
         let rt = tokio::runtime::Runtime::new()?;
-        return rt.block_on(run_headless_server(cli.port, cert, key, ca));
+        return rt.block_on(run_headless_server(
+            cli.port,
+            cli.cert,
+            cli.key,
+            cli.ca,
+            !cli.no_pairing,
+        ));
     }
 
     // Headless client mode
     if cli.client {
         let server = cli.connect.ok_or_else(|| anyhow::anyhow!("--connect is required"))?;
-        let cert = cli.cert.ok_or_else(|| anyhow::anyhow!("--cert is required"))?;
-        let key = cli.key.ok_or_else(|| anyhow::anyhow!("--key is required"))?;
-        let ca = cli.ca.ok_or_else(|| anyhow::anyhow!("--ca is required"))?;
         let name = if cli.name.is_empty() {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
@@ -107,7 +115,9 @@ fn main() -> anyhow::Result<()> {
             cli.name
         };
         let rt = tokio::runtime::Runtime::new()?;
-        return rt.block_on(run_headless_client(server, cert, key, ca, name));
+        return rt.block_on(run_headless_client(
+            server, cli.cert, cli.key, cli.ca, name, cli.pair,
+        ));
     }
 
     // Default: GUI mode — tokio runtime on background thread, GUI on main thread
@@ -124,10 +134,11 @@ fn run_gui_mode() -> anyhow::Result<()> {
 
     // Spawn a dedicated thread for the tokio runtime
     let state_for_rt = shared_state.clone();
+    let config_for_rt = config.clone();
     let _rt_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async move {
-            command_handler(cmd_rx, state_for_rt).await;
+            command_handler(cmd_rx, state_for_rt, config_for_rt).await;
         });
     });
 
@@ -140,7 +151,11 @@ fn run_gui_mode() -> anyhow::Result<()> {
 }
 
 /// Command handler: receives AppCommand and manages server/client lifecycle
-async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedState) {
+async fn command_handler(
+    mut cmd_rx: mpsc::Receiver<AppCommand>,
+    state: SharedState,
+    mut config: AppConfig,
+) {
     let mut server_shutdown: Option<broadcast::Sender<()>> = None;
     let mut client_shutdown: Option<broadcast::Sender<()>> = None;
 
@@ -153,6 +168,7 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                 cert_path,
                 key_path,
                 ca_path,
+                pairing_enabled,
             } => {
                 tracing::info!("Starting server on port {control_port}");
 
@@ -178,6 +194,9 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             ServerEvent::ClientDisconnected { name } => {
                                 tracing::info!("Client disconnected: {name}");
                                 s.connected_clients.retain(|c| c.name != name);
+                            }
+                            ServerEvent::ClientPaired { name } => {
+                                tracing::info!("Client paired: {name}");
                             }
                         }
                     }
@@ -336,6 +355,9 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                             ServerEvent::ClientDisconnected { name } => {
                                 tracing::info!("Client {name} disconnected");
                             }
+                            ServerEvent::ClientPaired { name } => {
+                                tracing::info!("Client {name} paired");
+                            }
                         }
                     }
                 });
@@ -343,12 +365,61 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                 let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
                 server_shutdown = Some(shutdown_tx);
 
+                // Resolve TLS material: use explicit paths if all provided,
+                // otherwise auto-generate a CA + server cert in the trust dir.
+                let resolved = match resolve_server_certs(&cert_path, &key_path, &ca_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("Failed to resolve server certificates: {e}");
+                        let mut s = state.write().unwrap();
+                        s.last_error = Some(format!("Certificate error: {e}"));
+                        continue;
+                    }
+                };
+
+                // Set up pairing support if enabled.
+                let pairing = if pairing_enabled {
+                    match build_pairing_support(&resolved, control_port).await {
+                        Ok((support, pin_manager, mut paired_rx)) => {
+                            // Reflect the current PIN into shared state for the GUI,
+                            // and persist newly paired clients into the config.
+                            let pin_state = state.clone();
+                            let pin_mgr = pin_manager.clone();
+                            tokio::spawn(async move {
+                                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                                loop {
+                                    tick.tick().await;
+                                    let pin = pin_mgr.current_pin();
+                                    let mut s = pin_state.write().unwrap();
+                                    s.pairing_pin = Some(pin);
+                                }
+                            });
+                            tokio::spawn(async move {
+                                while let Some(paired) = paired_rx.recv().await {
+                                    tracing::info!("Persisting paired client: {}", paired.name);
+                                    let mut cfg = AppConfig::load();
+                                    cfg.server.upsert_paired_client(paired);
+                                    let _ = cfg.save();
+                                }
+                            });
+                            Some(support)
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to enable pairing: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let config = ss_network::server::ServerConfig {
                     control_port,
                     data_port,
-                    cert_path,
-                    key_path,
-                    ca_path,
+                    cert_path: resolved.cert_path.clone(),
+                    key_path: resolved.key_path.clone(),
+                    ca_path: resolved.ca_path.clone(),
+                    pairing,
                 };
 
                 let state_clone = state.clone();
@@ -390,8 +461,28 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
             } => {
                 tracing::info!("Connecting to {server_address}");
 
+                // Resolve client trust material: explicit paths > known server.
+                // If neither is available, signal that pairing is required.
+                let resolved = resolve_client_certs(&config, &server_address, &cert_path, &key_path, &ca_path);
+                let (cert_path, key_path, ca_path) = match resolved {
+                    Some(paths) => paths,
+                    None => {
+                        tracing::info!("No trust for {server_address}; pairing required");
+                        let mut s = state.write().unwrap();
+                        s.pairing_required = true;
+                        s.pairing_status = None;
+                        s.last_error = Some("This server is not paired. Enter the PIN to pair.".to_string());
+                        continue;
+                    }
+                };
+
+                {
+                    let mut s = state.write().unwrap();
+                    s.pairing_required = false;
+                }
+
                 let (screen_w, screen_h) = detect_screen_size();
-                let config = ss_network::client::ClientConfig {
+                let config_net = ss_network::client::ClientConfig {
                     server_address: server_address.clone(),
                     cert_path,
                     key_path,
@@ -405,7 +496,109 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                 let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
                 client_shutdown = Some(shutdown_tx);
 
-                tokio::spawn(async move {
+                spawn_client_connection(config_net, server_address, state_clone);
+            }
+            AppCommand::PairAndConnect {
+                server_address,
+                pin,
+                device_name,
+            } => {
+                tracing::info!("Pairing with {server_address}");
+                {
+                    let mut s = state.write().unwrap();
+                    s.pairing_status = Some("Pairing…".to_string());
+                    s.last_error = None;
+                }
+
+                let host = server_address.split(':').next().unwrap_or(&server_address).to_string();
+                let control_port: u16 = server_address
+                    .split(':')
+                    .nth(1)
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(9876);
+                let pairing_port = ss_network::pairing::client::default_pairing_port(control_port);
+
+                let dev = if device_name.is_empty() {
+                    hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|_| "unknown".to_string())
+                } else {
+                    device_name.clone()
+                };
+
+                match ss_network::pairing::client::pair_with_server(&host, pairing_port, &pin, &dev).await {
+                    Ok(material) => {
+                        // Persist trust material and record the known server.
+                        match persist_client_trust(&server_address, &material) {
+                            Ok((cert_path, key_path, ca_path)) => {
+                                let fingerprint = ss_network::cert::cert_fingerprint(&material.ca_cert_pem).unwrap_or_default();
+                                config.client.upsert_known_server(ss_core::config::KnownServer {
+                                    address: server_address.clone(),
+                                    cert_path: cert_path.clone(),
+                                    key_path: key_path.clone(),
+                                    ca_path: ca_path.clone(),
+                                    server_fingerprint: fingerprint,
+                                });
+                                let _ = config.save();
+
+                                {
+                                    let mut s = state.write().unwrap();
+                                    s.pairing_required = false;
+                                    s.pairing_status = Some("Paired! Connecting…".to_string());
+                                }
+
+                                let (screen_w, screen_h) = detect_screen_size();
+                                let config_net = ss_network::client::ClientConfig {
+                                    server_address: server_address.clone(),
+                                    cert_path,
+                                    key_path,
+                                    ca_path,
+                                    device_name: dev,
+                                    screen_width: screen_w,
+                                    screen_height: screen_h,
+                                };
+                                let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+                                client_shutdown = Some(shutdown_tx);
+                                spawn_client_connection(config_net, server_address, state.clone());
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to persist trust material: {e}");
+                                let mut s = state.write().unwrap();
+                                s.pairing_status = Some(format!("Pairing failed: {e}"));
+                                s.last_error = Some(format!("Pairing failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Pairing failed: {e}");
+                        let mut s = state.write().unwrap();
+                        s.pairing_status = Some(format!("Pairing failed: {e}"));
+                        s.last_error = Some(format!("Pairing failed: {e}"));
+                    }
+                }
+            }
+            AppCommand::DisconnectClient => {
+                tracing::info!("Disconnecting client");
+                if let Some(tx) = client_shutdown.take() {
+                    let _ = tx.send(());
+                }
+                let mut s = state.write().unwrap();
+                s.client_connected = false;
+                s.client_server_addr = None;
+                s.server_screen_size = None;
+            }
+        }
+    }
+
+    tracing::info!("Command handler exiting");
+}
+
+/// Spawn the background task that maintains a client connection (with
+/// reconnect/backoff) and wires up input injection + clipboard sync.
+fn spawn_client_connection(
+    config: ss_network::client::ClientConfig,
+    server_address: String,
+    state_clone: SharedState,
+) {
+    tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_secs(1);
                     let max_backoff = std::time::Duration::from_secs(30);
                     let mut first_attempt = true;
@@ -640,35 +833,131 @@ async fn command_handler(mut cmd_rx: mpsc::Receiver<AppCommand>, state: SharedSt
                     }
                     } // end loop
                 });
+}
 
-                // Update state optimistically
-                {
-                    let mut s = state.write().unwrap();
-                    s.last_error = None;
-                }
-            }
-            AppCommand::DisconnectClient => {
-                tracing::info!("Disconnecting client");
-                if let Some(tx) = client_shutdown.take() {
-                    let _ = tx.send(());
-                }
-                let mut s = state.write().unwrap();
-                s.client_connected = false;
-                s.client_server_addr = None;
-                s.server_screen_size = None;
+/// Resolved server TLS material (all three PEM paths).
+struct ResolvedServerCerts {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    ca_path: PathBuf,
+    ca_cert_pem: String,
+    ca_key_pem: String,
+}
+
+/// Resolve server TLS material. If all explicit paths are given, use them;
+/// otherwise auto-generate (or reuse) a CA + server cert in the trust dir.
+fn resolve_server_certs(
+    cert_path: &Option<PathBuf>,
+    key_path: &Option<PathBuf>,
+    ca_path: &Option<PathBuf>,
+) -> anyhow::Result<ResolvedServerCerts> {
+    if let (Some(cert), Some(key), Some(ca)) = (cert_path, key_path, ca_path) {
+        let ca_cert_pem = std::fs::read_to_string(ca)?;
+        // CA key sits next to the CA cert by convention (ca.pem -> ca-key.pem).
+        let ca_key_pem = std::fs::read_to_string(ca.with_file_name(
+            ca.file_stem().map(|s| format!("{}-key.pem", s.to_string_lossy())).unwrap_or_else(|| "ca-key.pem".to_string()),
+        ))
+        .unwrap_or_default();
+        return Ok(ResolvedServerCerts {
+            cert_path: cert.clone(),
+            key_path: key.clone(),
+            ca_path: ca.clone(),
+            ca_cert_pem,
+            ca_key_pem,
+        });
+    }
+
+    // Auto-generate / reuse in the trust dir.
+    let dir = ss_core::config::ensure_trust_dir()?;
+    let server_ips = local_ips();
+    let ca = ss_network::cert::ensure_server_ca(&dir, &server_ips)?;
+    let ca_cert_pem = std::fs::read_to_string(&ca.ca_cert_path)?;
+    let ca_key_pem = std::fs::read_to_string(&ca.ca_key_path)?;
+    Ok(ResolvedServerCerts {
+        cert_path: ca.server_cert_path,
+        key_path: ca.server_key_path,
+        ca_path: ca.ca_cert_path,
+        ca_cert_pem,
+        ca_key_pem,
+    })
+}
+
+/// Build pairing support for the server: the listener config, a shared PIN
+/// manager, and a receiver for newly-paired clients.
+async fn build_pairing_support(
+    resolved: &ResolvedServerCerts,
+    control_port: u16,
+) -> anyhow::Result<(
+    ss_network::server::PairingSupport,
+    Arc<ss_network::pairing::server::PinManager>,
+    mpsc::Receiver<ss_core::config::PairedClient>,
+)> {
+    let pin_manager = Arc::new(ss_network::pairing::server::PinManager::new());
+    let (paired_tx, paired_rx) = mpsc::channel(8);
+    let pairing_port = ss_network::pairing::client::default_pairing_port(control_port);
+    tracing::info!("Pairing PIN: {}", pin_manager.current_pin());
+    let support = ss_network::server::PairingSupport {
+        pairing_port,
+        ca_cert_pem: resolved.ca_cert_pem.clone(),
+        ca_key_pem: resolved.ca_key_pem.clone(),
+        pin_manager: pin_manager.clone(),
+        on_paired: paired_tx,
+    };
+    Ok((support, pin_manager, paired_rx))
+}
+
+/// Resolve client TLS material for a server address. Explicit paths win;
+/// otherwise use a known (paired) server. Returns None if pairing is needed.
+fn resolve_client_certs(
+    config: &AppConfig,
+    server_address: &str,
+    cert_path: &Option<PathBuf>,
+    key_path: &Option<PathBuf>,
+    ca_path: &Option<PathBuf>,
+) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    if let (Some(c), Some(k), Some(a)) = (cert_path, key_path, ca_path) {
+        return Some((c.clone(), k.clone(), a.clone()));
+    }
+    config
+        .client
+        .find_known_server(server_address)
+        .map(|s| (s.cert_path.clone(), s.key_path.clone(), s.ca_path.clone()))
+}
+
+/// Persist provisioned client trust material to the trust dir.
+fn persist_client_trust(
+    server_address: &str,
+    material: &ss_network::pairing::PairedMaterial,
+) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
+    ss_core::config::write_trust_material(
+        server_address,
+        &material.client_cert_pem,
+        &material.client_key_pem,
+        &material.ca_cert_pem,
+    )
+}
+
+/// Best-effort enumeration of local non-loopback IPv4 addresses for cert SANs.
+fn local_ips() -> Vec<std::net::IpAddr> {
+    // Use a UDP socket trick to discover the primary outbound IP.
+    let mut ips = Vec::new();
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                ips.push(addr.ip());
             }
         }
     }
-
-    tracing::info!("Command handler exiting");
+    ips
 }
 
 /// Run headless server (CLI mode)
 async fn run_headless_server(
     port: u16,
-    cert: PathBuf,
-    key: PathBuf,
-    ca: PathBuf,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    ca: Option<PathBuf>,
+    pairing_enabled: bool,
 ) -> anyhow::Result<()> {
     tracing::info!("Starting headless server on port {port}");
 
@@ -684,16 +973,38 @@ async fn run_headless_server(
             match event {
                 ServerEvent::ClientConnected { name } => tracing::info!("Client connected: {name}"),
                 ServerEvent::ClientDisconnected { name } => tracing::info!("Client disconnected: {name}"),
+                ServerEvent::ClientPaired { name } => tracing::info!("Client paired: {name}"),
             }
         }
     });
 
+    // Resolve TLS material (auto-generate CA if not provided).
+    let resolved = resolve_server_certs(&cert, &key, &ca)?;
+
+    // Set up pairing if enabled.
+    let pairing = if pairing_enabled {
+        let (support, pin_manager, mut paired_rx) = build_pairing_support(&resolved, port).await?;
+        println!("Pairing enabled. PIN: {}", pin_manager.current_pin());
+        // Persist newly paired clients.
+        tokio::spawn(async move {
+            while let Some(paired) = paired_rx.recv().await {
+                let mut cfg = AppConfig::load();
+                cfg.server.upsert_paired_client(paired);
+                let _ = cfg.save();
+            }
+        });
+        Some(support)
+    } else {
+        None
+    };
+
     let config = ss_network::server::ServerConfig {
         control_port: port,
         data_port: port + 1,
-        cert_path: cert,
-        key_path: key,
-        ca_path: ca,
+        cert_path: resolved.cert_path,
+        key_path: resolved.key_path,
+        ca_path: resolved.ca_path,
+        pairing,
     };
 
     // Handle Ctrl+C
@@ -709,19 +1020,73 @@ async fn run_headless_server(
 /// Run headless client (CLI mode)
 async fn run_headless_client(
     server: String,
-    cert: PathBuf,
-    key: PathBuf,
-    ca: PathBuf,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    ca: Option<PathBuf>,
     name: String,
+    pair: bool,
 ) -> anyhow::Result<()> {
     tracing::info!("Connecting to {server} as {name}");
+
+    let mut config = AppConfig::load();
+
+    // Resolve trust: explicit paths > known server > pairing.
+    let (cert_path, key_path, ca_path) =
+        match resolve_client_certs(&config, &server, &cert, &key, &ca) {
+            Some(paths) => paths,
+            None => {
+                if !pair {
+                    anyhow::bail!(
+                        "No trust material for {server}. Re-run with --pair to pair using a PIN."
+                    );
+                }
+                // Prompt for the PIN on stdin and pair.
+                let host = server.split(':').next().unwrap_or(&server).to_string();
+                let control_port: u16 = server
+                    .split(':')
+                    .nth(1)
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(9876);
+                let pairing_port = ss_network::pairing::client::default_pairing_port(control_port);
+
+                eprint!("Enter pairing PIN shown on the server: ");
+                use std::io::Write;
+                std::io::stderr().flush().ok();
+                let mut pin = String::new();
+                std::io::stdin().read_line(&mut pin)?;
+                let pin = pin.trim().to_string();
+
+                let material = ss_network::pairing::client::pair_with_server(
+                    &host,
+                    pairing_port,
+                    &pin,
+                    &name,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("pairing failed: {e}"))?;
+
+                let (cert_path, key_path, ca_path) = persist_client_trust(&server, &material)?;
+                let fingerprint =
+                    ss_network::cert::cert_fingerprint(&material.ca_cert_pem).unwrap_or_default();
+                config.client.upsert_known_server(ss_core::config::KnownServer {
+                    address: server.clone(),
+                    cert_path: cert_path.clone(),
+                    key_path: key_path.clone(),
+                    ca_path: ca_path.clone(),
+                    server_fingerprint: fingerprint,
+                });
+                let _ = config.save();
+                tracing::info!("Paired successfully; trust persisted.");
+                (cert_path, key_path, ca_path)
+            }
+        };
 
     let (screen_w, screen_h) = detect_screen_size();
     let config = ss_network::client::ClientConfig {
         server_address: server,
-        cert_path: cert,
-        key_path: key,
-        ca_path: ca,
+        cert_path,
+        key_path,
+        ca_path,
         device_name: name,
         screen_width: screen_w,
         screen_height: screen_h,

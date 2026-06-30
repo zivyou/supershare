@@ -26,6 +26,12 @@ pub struct SharedAppState {
     pub server_screen_size: Option<(u32, u32)>,
     /// Last error message to display
     pub last_error: Option<String>,
+    /// Current pairing PIN to display (server side, when pairing enabled)
+    pub pairing_pin: Option<String>,
+    /// Whether the client needs the user to enter a pairing PIN
+    pub pairing_required: bool,
+    /// Status message for an in-progress or failed pairing (client side)
+    pub pairing_status: Option<String>,
 }
 
 impl Default for SharedAppState {
@@ -38,6 +44,9 @@ impl Default for SharedAppState {
             client_server_addr: None,
             server_screen_size: None,
             last_error: None,
+            pairing_pin: None,
+            pairing_required: false,
+            pairing_status: None,
         }
     }
 }
@@ -48,22 +57,32 @@ pub type SharedState = Arc<RwLock<SharedAppState>>;
 /// Commands sent from UI to backend
 #[derive(Debug)]
 pub enum AppCommand {
-    /// Start the server with the given configuration
+    /// Start the server with the given configuration.
+    /// Cert paths are optional; when omitted the server auto-generates a CA.
     StartServer {
         control_port: u16,
         data_port: u16,
-        cert_path: std::path::PathBuf,
-        key_path: std::path::PathBuf,
-        ca_path: std::path::PathBuf,
+        cert_path: Option<std::path::PathBuf>,
+        key_path: Option<std::path::PathBuf>,
+        ca_path: Option<std::path::PathBuf>,
+        /// Whether to enable PIN-based pairing.
+        pairing_enabled: bool,
     },
     /// Stop the running server
     StopServer,
-    /// Connect as a client to the given server
+    /// Connect as a client to the given server.
+    /// Cert paths are optional; when omitted, persisted trust (or pairing) is used.
     ConnectClient {
         server_address: String,
-        cert_path: std::path::PathBuf,
-        key_path: std::path::PathBuf,
-        ca_path: std::path::PathBuf,
+        cert_path: Option<std::path::PathBuf>,
+        key_path: Option<std::path::PathBuf>,
+        ca_path: Option<std::path::PathBuf>,
+        device_name: String,
+    },
+    /// Pair with a server using a PIN, then connect.
+    PairAndConnect {
+        server_address: String,
+        pin: String,
         device_name: String,
     },
     /// Disconnect the client

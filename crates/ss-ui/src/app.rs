@@ -20,6 +20,8 @@ pub struct SuperShareApp {
     cmd_tx: CommandSender,
     /// Validation error message
     validation_error: Option<String>,
+    /// PIN entered by the user when pairing is required
+    pin_input: String,
 }
 
 impl SuperShareApp {
@@ -30,6 +32,7 @@ impl SuperShareApp {
             shared_state,
             cmd_tx,
             validation_error: None,
+            pin_input: String::new(),
         }
     }
 }
@@ -87,63 +90,58 @@ impl SuperShareApp {
                     egui::DragValue::new(&mut self.config.server.data_port).range(1024..=65535),
                 );
                 ui.end_row();
+            });
 
-                ui.label("TLS Certificate:");
-                let cert_text = self
-                    .config
-                    .server
-                    .cert_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                ui.label(&cert_text);
-                if ui.add_enabled(enabled, egui::Button::new("Browse...")).clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PEM", &["pem", "crt"])
-                        .pick_file()
-                    {
-                        self.config.server.cert_path = Some(path);
-                    }
-                }
-                ui.end_row();
+        ui.add_space(8.0);
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(
+                &mut self.config.server.pairing_enabled,
+                "Enable pairing (let clients connect with just a PIN)",
+            ),
+        );
 
-                ui.label("TLS Key:");
-                let key_text = self
-                    .config
-                    .server
-                    .key_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                ui.label(&key_text);
-                if ui.add_enabled(enabled, egui::Button::new("Browse...")).clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PEM", &["pem", "key"])
-                        .pick_file()
-                    {
-                        self.config.server.key_path = Some(path);
-                    }
-                }
-                ui.end_row();
+        // Show the current pairing PIN when the server is running with pairing.
+        if state.server_running && self.config.server.pairing_enabled {
+            if let Some(pin) = &state.pairing_pin {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Pairing PIN:");
+                    ui.label(
+                        egui::RichText::new(pin)
+                            .heading()
+                            .color(egui::Color32::LIGHT_BLUE)
+                            .monospace(),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new("Enter this PIN on the client to pair.")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            }
+        }
 
-                ui.label("CA Certificate:");
-                let ca_text = self
-                    .config
-                    .server
-                    .ca_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                ui.label(&ca_text);
-                if ui.add_enabled(enabled, egui::Button::new("Browse...")).clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PEM", &["pem", "crt"])
-                        .pick_file()
-                    {
-                        self.config.server.ca_path = Some(path);
-                    }
-                }
-                ui.end_row();
+        // Advanced: optional explicit TLS certificate paths.
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Advanced: TLS certificates (optional)")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Leave blank to auto-generate a CA on first run. Set these only for manual/advanced deployments.",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+                egui::Grid::new("server_cert_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        cert_path_row(ui, enabled, "TLS Certificate:", &mut self.config.server.cert_path, &["pem", "crt"]);
+                        cert_path_row(ui, enabled, "TLS Key:", &mut self.config.server.key_path, &["pem", "key"]);
+                        cert_path_row(ui, enabled, "CA Certificate:", &mut self.config.server.ca_path, &["pem", "crt"]);
+                    });
             });
 
         ui.add_space(12.0);
@@ -157,21 +155,26 @@ impl SuperShareApp {
                 }
             } else {
                 if ui.button("▶ Start Server").clicked() {
-                    // Validate config
-                    if self.config.server.cert_path.is_none()
-                        || self.config.server.key_path.is_none()
-                        || self.config.server.ca_path.is_none()
-                    {
-                        cmd_to_send = None;
-                        // Will show error below
-                        self.validation_error = Some("Please configure TLS certificate, key, and CA paths first.".to_string());
+                    // Cert paths are optional now — the server auto-generates a
+                    // CA when they are not provided. But if any are set, all must be.
+                    let some = self.config.server.cert_path.is_some()
+                        || self.config.server.key_path.is_some()
+                        || self.config.server.ca_path.is_some();
+                    let all = self.config.server.cert_path.is_some()
+                        && self.config.server.key_path.is_some()
+                        && self.config.server.ca_path.is_some();
+                    if some && !all {
+                        self.validation_error = Some(
+                            "Provide all three (cert, key, CA) or leave all blank to auto-generate.".to_string(),
+                        );
                     } else {
                         cmd_to_send = Some(AppCommand::StartServer {
                             control_port: self.config.server.control_port,
                             data_port: self.config.server.data_port,
-                            cert_path: self.config.server.cert_path.clone().unwrap(),
-                            key_path: self.config.server.key_path.clone().unwrap(),
-                            ca_path: self.config.server.ca_path.clone().unwrap(),
+                            cert_path: self.config.server.cert_path.clone(),
+                            key_path: self.config.server.key_path.clone(),
+                            ca_path: self.config.server.ca_path.clone(),
+                            pairing_enabled: self.config.server.pairing_enabled,
                         });
                         self.validation_error = None;
                     }
@@ -270,66 +273,47 @@ impl SuperShareApp {
                 ui.add_enabled(enabled, egui::TextEdit::singleline(&mut addr));
                 self.config.client.server_address = if addr.is_empty() { None } else { Some(addr) };
                 ui.end_row();
+            });
 
-                ui.label("TLS Certificate:");
-                let cert_text = self
-                    .config
-                    .client
-                    .cert_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                ui.label(&cert_text);
-                if ui.add_enabled(enabled, egui::Button::new("Browse...")).clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PEM", &["pem", "crt"])
-                        .pick_file()
-                    {
-                        self.config.client.cert_path = Some(path);
-                    }
-                }
-                ui.end_row();
-
-                ui.label("TLS Key:");
-                let key_text = self
-                    .config
-                    .client
-                    .key_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                ui.label(&key_text);
-                if ui.add_enabled(enabled, egui::Button::new("Browse...")).clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PEM", &["pem", "key"])
-                        .pick_file()
-                    {
-                        self.config.client.key_path = Some(path);
-                    }
-                }
-                ui.end_row();
-
-                ui.label("CA Certificate:");
-                let ca_text = self
-                    .config
-                    .client
-                    .ca_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                ui.label(&ca_text);
-                if ui.add_enabled(enabled, egui::Button::new("Browse...")).clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("PEM", &["pem", "crt"])
-                        .pick_file()
-                    {
-                        self.config.client.ca_path = Some(path);
-                    }
-                }
-                ui.end_row();
+        // Advanced: optional explicit TLS certificate paths (override pairing).
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Advanced: TLS certificates (optional)")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Leave blank to pair automatically with a PIN. Set these only to use manually-issued certificates.",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+                egui::Grid::new("client_cert_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        cert_path_row(ui, enabled, "TLS Certificate:", &mut self.config.client.cert_path, &["pem", "crt"]);
+                        cert_path_row(ui, enabled, "TLS Key:", &mut self.config.client.key_path, &["pem", "key"]);
+                        cert_path_row(ui, enabled, "CA Certificate:", &mut self.config.client.ca_path, &["pem", "crt"]);
+                    });
             });
 
         ui.add_space(12.0);
+
+        // PIN prompt when the backend signals pairing is required.
+        if state.pairing_required && !state.client_connected {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("This server is not paired yet. Enter the PIN shown on the server:")
+                    .color(egui::Color32::LIGHT_YELLOW),
+            );
+            ui.horizontal(|ui| {
+                ui.label("PIN:");
+                ui.add(egui::TextEdit::singleline(&mut self.pin_input).desired_width(120.0));
+            });
+            if let Some(status) = &state.pairing_status {
+                ui.colored_label(egui::Color32::LIGHT_BLUE, status);
+            }
+        }
 
         // Connect/Disconnect button and status
         let mut cmd_to_send: Option<AppCommand> = None;
@@ -338,20 +322,33 @@ impl SuperShareApp {
                 if ui.button("■ Disconnect").clicked() {
                     cmd_to_send = Some(AppCommand::DisconnectClient);
                 }
+            } else if state.pairing_required {
+                if ui.button("🔑 Pair & Connect").clicked() {
+                    if self.config.client.server_address.is_none() {
+                        self.validation_error = Some("Please enter the server address.".to_string());
+                    } else if self.pin_input.trim().is_empty() {
+                        self.validation_error = Some("Please enter the pairing PIN.".to_string());
+                    } else {
+                        cmd_to_send = Some(AppCommand::PairAndConnect {
+                            server_address: self.config.client.server_address.clone().unwrap(),
+                            pin: self.pin_input.trim().to_string(),
+                            device_name: self.config.client.device_name.clone(),
+                        });
+                        self.validation_error = None;
+                    }
+                }
             } else {
                 if ui.button("▶ Connect").clicked() {
-                    if self.config.client.server_address.is_none()
-                        || self.config.client.cert_path.is_none()
-                        || self.config.client.key_path.is_none()
-                        || self.config.client.ca_path.is_none()
-                    {
-                        self.validation_error = Some("Please configure server address and TLS paths first.".to_string());
+                    if self.config.client.server_address.is_none() {
+                        self.validation_error = Some("Please enter the server address.".to_string());
                     } else {
+                        // Cert paths optional: pass them through; backend resolves
+                        // persisted trust / pairing when they are absent.
                         cmd_to_send = Some(AppCommand::ConnectClient {
                             server_address: self.config.client.server_address.clone().unwrap(),
-                            cert_path: self.config.client.cert_path.clone().unwrap(),
-                            key_path: self.config.client.key_path.clone().unwrap(),
-                            ca_path: self.config.client.ca_path.clone().unwrap(),
+                            cert_path: self.config.client.cert_path.clone(),
+                            key_path: self.config.client.key_path.clone(),
+                            ca_path: self.config.client.ca_path.clone(),
                             device_name: self.config.client.device_name.clone(),
                         });
                         self.validation_error = None;
@@ -430,6 +427,33 @@ impl SuperShareApp {
             }
         }
     }
+}
+
+/// Render a labelled certificate-path row with a Browse button into a Grid.
+fn cert_path_row(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    path: &mut Option<std::path::PathBuf>,
+    filters: &[&str],
+) {
+    ui.label(label);
+    let text = path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(&text);
+        if ui.add_enabled(enabled, egui::Button::new("Browse...")).clicked() {
+            if let Some(picked) = rfd::FileDialog::new()
+                .add_filter("PEM", filters)
+                .pick_file()
+            {
+                *path = Some(picked);
+            }
+        }
+        if path.is_some() && ui.add_enabled(enabled, egui::Button::new("✖")).clicked() {
+            *path = None;
+        }
+    });
+    ui.end_row();
 }
 
 /// Launch the configuration GUI with runtime integration

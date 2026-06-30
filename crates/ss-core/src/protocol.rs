@@ -45,6 +45,11 @@ pub enum MessageType {
     BoundaryEnter = 0x0C,
     BoundaryLeave = 0x0D,
     MouseDelta = 0x0E,
+    PairRequest = 0x0F,
+    PairSpake = 0x10,
+    PairConfirm = 0x11,
+    PairResult = 0x12,
+    PairError = 0x13,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -66,6 +71,11 @@ impl TryFrom<u8> for MessageType {
             0x0C => Ok(Self::BoundaryEnter),
             0x0D => Ok(Self::BoundaryLeave),
             0x0E => Ok(Self::MouseDelta),
+            0x0F => Ok(Self::PairRequest),
+            0x10 => Ok(Self::PairSpake),
+            0x11 => Ok(Self::PairConfirm),
+            0x12 => Ok(Self::PairResult),
+            0x13 => Ok(Self::PairError),
             _ => anyhow::bail!("Unknown message type: 0x{:02X}", value),
         }
     }
@@ -154,6 +164,38 @@ pub enum Message {
     BoundaryLeave {
         source_screen: u8,
     },
+
+    /// Pairing: client initiates pairing, announcing its desired device name.
+    /// Sent in the clear on the pairing channel before the PAKE exchange.
+    PairRequest {
+        version: u8,
+        name: String,
+    },
+
+    /// Pairing: a SPAKE2 protocol message (opaque bytes). Exchanged in both
+    /// directions to establish a shared session key from the PIN.
+    PairSpake {
+        msg: Vec<u8>,
+    },
+
+    /// Pairing: AEAD-encrypted provisioning payload sent by the client once the
+    /// session key is derived. Carries the client's public key + device name.
+    PairConfirm {
+        nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+    },
+
+    /// Pairing: AEAD-encrypted result sent by the server. Carries the signed
+    /// client certificate and the CA certificate (PEM) on success.
+    PairResult {
+        nonce: Vec<u8>,
+        ciphertext: Vec<u8>,
+    },
+
+    /// Pairing: failure notification with a human-readable reason.
+    PairError {
+        reason: String,
+    },
 }
 
 impl Message {
@@ -174,6 +216,11 @@ impl Message {
             Message::ScreenConfig { .. } => MessageType::ScreenConfig,
             Message::BoundaryEnter { .. } => MessageType::BoundaryEnter,
             Message::BoundaryLeave { .. } => MessageType::BoundaryLeave,
+            Message::PairRequest { .. } => MessageType::PairRequest,
+            Message::PairSpake { .. } => MessageType::PairSpake,
+            Message::PairConfirm { .. } => MessageType::PairConfirm,
+            Message::PairResult { .. } => MessageType::PairResult,
+            Message::PairError { .. } => MessageType::PairError,
         }
     }
 
@@ -230,5 +277,54 @@ impl ClipboardContent {
         };
         let h = blake3::hash(data);
         *h.as_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip a message through encode/decode (the payload portion of a frame).
+    fn roundtrip(msg: Message) {
+        let mt = msg.msg_type();
+        let bytes = msg.encode().expect("encode");
+        let decoded = Message::decode(mt, &bytes).expect("decode");
+        assert_eq!(decoded.msg_type(), mt);
+    }
+
+    #[test]
+    fn pairing_variants_roundtrip() {
+        roundtrip(Message::PairRequest {
+            version: 1,
+            name: "laptop".to_string(),
+        });
+        roundtrip(Message::PairSpake {
+            msg: vec![1, 2, 3, 4, 5],
+        });
+        roundtrip(Message::PairConfirm {
+            nonce: vec![9; 12],
+            ciphertext: vec![7; 64],
+        });
+        roundtrip(Message::PairResult {
+            nonce: vec![3; 12],
+            ciphertext: vec![8; 256],
+        });
+        roundtrip(Message::PairError {
+            reason: "wrong PIN".to_string(),
+        });
+    }
+
+    #[test]
+    fn pairing_message_types_map_back() {
+        for mt in [
+            MessageType::PairRequest,
+            MessageType::PairSpake,
+            MessageType::PairConfirm,
+            MessageType::PairResult,
+            MessageType::PairError,
+        ] {
+            let byte = mt as u8;
+            assert_eq!(MessageType::try_from(byte).unwrap(), mt);
+        }
     }
 }

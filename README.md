@@ -63,23 +63,7 @@ cargo build --release
 
 ### Quick Start
 
-#### 1. Generate Certificates
-
-On any machine, generate a CA and device certificates:
-
-```bash
-# Generate CA certificate
-supershare --gen-cert --output ./certs
-
-# Generate device certificates (run for each machine)
-supershare --gen-cert --device machine1 --output ./certs
-supershare --gen-cert --device machine2 --output ./certs
-```
-
-Distribute the certificates to each machine:
-- Each machine needs: `ca.pem`, its own `<name>.pem`, and `<name>-key.pem`
-
-#### 2. Launch SuperShare
+#### 1. Launch SuperShare
 
 Simply run `supershare` to open the GUI:
 
@@ -88,20 +72,48 @@ supershare
 ```
 
 The GUI provides:
-- **Server tab**: Configure and start/stop the server, see connected clients in real-time
-- **Client tab**: Configure and connect/disconnect to a server
-- **Clipboard tab**: Configure clipboard sync settings
+- **Server tab**: Start/stop the server and enable pairing; the current pairing **PIN** is shown while running. See connected clients in real-time.
+- **Client tab**: Enter just the server's IP and connect. The first time, you'll be prompted for the PIN shown on the server.
+- **Clipboard tab**: Configure clipboard sync settings.
+
+No certificate files to copy — the server is its own CA and provisions the client automatically during pairing. Once paired, reconnecting needs no PIN.
+
+#### 2. Pairing (how trust is established)
+
+1. On the **server**, enable pairing — it displays a 6-digit PIN.
+2. On the **client**, enter the server IP and the PIN, then connect.
+3. The two negotiate trust over a PIN-authenticated (SPAKE2) channel; the server signs a certificate for the client. A man-in-the-middle without the PIN cannot intercept this.
+4. Trust is saved on both sides; future connections are silent.
 
 #### 3. Headless Mode (Optional)
 
-For servers or scripted environments, use headless mode:
+For servers or scripted environments, use headless mode. Certificates are optional — omit them to auto-generate/pair:
 
 ```bash
-# Headless server
-supershare --server --port 9876 --cert certs/server.pem --key certs/server-key.pem --ca certs/ca.pem
+# Headless server (auto-generates CA, prints the pairing PIN)
+supershare --server --port 9876
 
-# Headless client
-supershare --client --connect 192.168.1.100:9876 --cert certs/client.pem --key certs/client-key.pem --ca certs/ca.pem --name my-pc
+# Headless client — first time: pair with a PIN (read from stdin)
+supershare --client --connect 192.168.1.100 --pair --name my-pc
+
+# Headless client — afterwards: reconnect silently using saved trust
+supershare --client --connect 192.168.1.100 --name my-pc
+```
+
+#### Advanced: manual certificates
+
+For manual/advanced deployments you can still generate and supply certificates explicitly (this bypasses pairing):
+
+```bash
+# Generate CA certificate
+supershare --gen-cert --output ./certs
+
+# Generate device certificates (run for each machine)
+supershare --gen-cert --device machine1 --ca-cert certs/ca.pem --ca-key certs/ca-key.pem --output ./certs
+
+# Use them (all three paths required; --no-pairing disables the PIN listener)
+supershare --server --port 9876 --no-pairing --cert certs/server.pem --key certs/server-key.pem --ca certs/ca.pem
+supershare --client --connect 192.168.1.100:9876 --cert certs/machine1.pem --key certs/machine1-key.pem --ca certs/ca.pem --name my-pc
 ```
 
 ### Usage
