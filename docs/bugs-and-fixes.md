@@ -123,6 +123,21 @@
 
 ---
 
+## Bug 11: 无 Client 时鼠标移出右边界后丢失
+
+**现象**：Server 已启动但 Client 还没连接时，把鼠标移出右边界，Server 的鼠标就"丢"了——卡在右边缘，怎么都移不回来。
+
+**根因**：`warp_capture` 的回调在逻辑光标越过右边界时**无条件**进入 remote 模式，不管有没有 Client 连接。进入 remote 后所有输入事件被 suppress，真实光标冻结在越界点；而退出 remote 的唯一途径是 Client 发来 `BoundaryLeave`——没有 Client 就永远收不到，光标永远冻结。同理，Client 在 remote 会话中途断开也会卡在 remote 模式。
+
+**修复**：
+
+1. `warp_capture` 新增 `has_client: Arc<AtomicBool>`（由 main.rs 的 ClientConnected/ClientDisconnected 事件维护）。越过右边界时只有在 `has_client == true` 才进入 remote 模式；无 Client 时事件正常透传，光标像普通屏幕一样停在边缘。
+2. 回调每次事件先检查：remote 模式下若 `has_client` 变 false（Client 中途断开），自动退出 remote 并把逻辑光标恢复到冻结点——自愈，不依赖外部信号。
+
+**教训**：进入「只有对端才能解除」的状态前，必须确认对端存在；并且状态存续期间要能对「对端消失」自愈。任何 suppress 本机输入的模式都要有无条件的本地退出路径。
+
+---
+
 ## 经验总结
 
 1. **tokio::spawn 的 move 语义**：变量被 move 进 async block 后，原作用域不可再用。多个 task 共享资源时必须 clone。

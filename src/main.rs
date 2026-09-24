@@ -177,9 +177,17 @@ async fn command_handler(
                 tracing::info!("Detected screen: {screen_w}x{screen_h}");
                 let server_state = Arc::new(ss_network::server::ServerState::new(screen_w, screen_h));
 
+                // --- Server-side sharing: rdev input capture with cursor warping + clipboard ---
+
+                // Start warp-based input capture (no root required)
+                let warp_capture = ss_input::warp_capture::start_capture(screen_w, screen_h)
+                    .expect("Failed to start warp capture.");
+                let mut input_rx = warp_capture.event_rx;
+
                 // Listen for server events
                 let mut notify_rx = server_state.notify_tx.subscribe();
                 let state_for_events = state.clone();
+                let has_client = warp_capture.has_client.clone();
                 tokio::spawn(async move {
                     while let Ok(event) = notify_rx.recv().await {
                         let mut s = state_for_events.write().unwrap();
@@ -190,10 +198,18 @@ async fn command_handler(
                                     name,
                                     connected_at: std::time::Instant::now(),
                                 });
+                                // Allow the capture layer to enter remote mode.
+                                has_client.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             ServerEvent::ClientDisconnected { name } => {
                                 tracing::info!("Client disconnected: {name}");
                                 s.connected_clients.retain(|c| c.name != name);
+                                if s.connected_clients.is_empty() {
+                                    // No clients left: the capture layer must not
+                                    // enter (or stay in) remote mode — the cursor
+                                    // would freeze with no one to bring it back.
+                                    has_client.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                             ServerEvent::ClientPaired { name } => {
                                 tracing::info!("Client paired: {name}");
@@ -201,13 +217,6 @@ async fn command_handler(
                         }
                     }
                 });
-
-                // --- Server-side sharing: rdev input capture with cursor warping + clipboard ---
-
-                // Start warp-based input capture (no root required)
-                let warp_capture = ss_input::warp_capture::start_capture(screen_w, screen_h)
-                    .expect("Failed to start warp capture.");
-                let mut input_rx = warp_capture.event_rx;
 
                 // Start clipboard monitor
                 let monitor = ss_clipboard::monitor::ClipboardMonitor::new();

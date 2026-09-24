@@ -9,11 +9,16 @@
 //!    reflects warps. Therefore deltas MUST be computed from consecutive
 //!    reported positions only, and no cursor warping is needed (or valid).
 //! 3. Local mode: events pass through. When the logical cursor crosses the
-//!    right edge, enter remote mode and notify the client (BoundaryEnter).
+//!    right edge AND at least one client is connected (has_client), enter
+//!    remote mode and notify the client (BoundaryEnter). With no client,
+//!    events pass through and the cursor just stops at the edge.
 //! 4. Remote mode: ALL events are suppressed, so the real cursor stays frozen
 //!    at the crossing point; deltas are forwarded to the client.
 //! 5. The client decides when to return (its own left edge) and sends
-//!    BoundaryLeave; the server then sets exit_remote to switch back.
+//!    BoundaryLeave; the server then sets exit_remote to switch back. If the
+//!    client disconnects while remote (has_client goes false), remote mode
+//!    exits automatically — otherwise the frozen cursor would be stuck forever
+//!    with no one left to send BoundaryLeave.
 
 use rdev::EventType;
 use ss_core::protocol::Button;
@@ -48,6 +53,10 @@ pub struct WarpCaptureHandle {
     pub is_remote: Arc<AtomicBool>,
     /// External signal to exit remote mode (set to true to exit).
     pub exit_remote: Arc<AtomicBool>,
+    /// Whether at least one client is connected. Remote mode is only entered
+    /// while this is true; if it goes false mid-session, remote mode exits
+    /// automatically on the next event.
+    pub has_client: Arc<AtomicBool>,
 }
 
 /// Shared state for the rdev callback.
@@ -75,6 +84,8 @@ struct CallbackState {
     is_remote: Arc<AtomicBool>,
     /// External signal to exit remote mode.
     exit_remote: Arc<AtomicBool>,
+    /// Whether at least one client is connected.
+    has_client: Arc<AtomicBool>,
 }
 
 /// Start capturing input events with delta-based boundary detection.
@@ -90,6 +101,7 @@ pub fn start_capture(
     let (tx, rx) = mpsc::channel::<WarpInputEvent>(256);
     let is_remote = Arc::new(AtomicBool::new(false));
     let exit_remote = Arc::new(AtomicBool::new(false));
+    let has_client = Arc::new(AtomicBool::new(false));
 
     let state = CallbackState {
         tx: tx.clone(),
@@ -104,6 +116,7 @@ pub fn start_capture(
         frozen_y: 0.0,
         is_remote: is_remote.clone(),
         exit_remote: exit_remote.clone(),
+        has_client: has_client.clone(),
     };
 
     let state = Arc::new(Mutex::new(state));
@@ -115,10 +128,14 @@ pub fn start_capture(
         let callback = move |event: rdev::Event| -> Option<rdev::Event> {
             let mut state = callback_state.lock().unwrap();
 
-            // Check for external signal to exit remote mode
-            if state.exit_remote.load(Ordering::Relaxed) {
-                state.is_remote.store(false, Ordering::Relaxed);
-                state.exit_remote.store(false, Ordering::Relaxed);
+            // Exit remote mode when requested externally, OR when the client
+            // went away while remote (disconnect, or never connected). Without
+            // the latter, the frozen cursor would be stuck forever: no client
+            // means no BoundaryLeave will ever arrive.
+            let exit_requested = state.exit_remote.swap(false, Ordering::Relaxed);
+            let client_gone = state.is_remote.load(Ordering::Relaxed)
+                && !state.has_client.load(Ordering::Relaxed);
+            if (exit_requested || client_gone) && state.is_remote.swap(false, Ordering::Relaxed) {
                 // The real cursor was frozen at the crossing point the whole
                 // time we were in remote mode (all events suppressed), so
                 // restoring the logical position to the frozen point keeps it
@@ -168,8 +185,14 @@ pub fn start_capture(
                         return None;
                     }
 
-                    // Local mode: cross into remote mode at the right edge.
-                    if state.pos_x >= state.screen_width - 1.0 {
+                    // Local mode: cross into remote mode at the right edge,
+                    // but only when a client is connected. With no client,
+                    // entering remote mode would freeze the real cursor with
+                    // no one able to bring it back — pass through instead and
+                    // let the cursor stop at the edge like a normal screen.
+                    if state.pos_x >= state.screen_width - 1.0
+                        && state.has_client.load(Ordering::Relaxed)
+                    {
                         state.is_remote.store(true, Ordering::Relaxed);
                         state.frozen_x = state.pos_x;
                         state.frozen_y = state.pos_y;
@@ -270,6 +293,7 @@ pub fn start_capture(
         screen_height,
         is_remote,
         exit_remote,
+        has_client,
     })
 }
 
