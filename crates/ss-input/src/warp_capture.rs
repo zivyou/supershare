@@ -1,16 +1,19 @@
-//! rdev-based input capture with cursor warping for delta calculation.
-//!
-//! This approach uses rdev::grab (evdev grab) for input capture and rdev::simulate (XTest)
-//! for cursor warping. It doesn't require root permissions or udev rules.
+//! rdev-based input capture with delta-based cursor tracking.
 //!
 //! How it works:
-//! 1. Grab input devices via rdev::grab (intercept events before X Server)
-//! 2. When cursor hits right edge, warp it back to screen center
-//! 3. Calculate delta from the real position before warp
-//! 4. Forward delta to client
-//! 5. In remote mode, suppress events from reaching X Server (return None)
-//!
-//! This is the same approach used by Deskflow/Synergy/Barrier.
+//! 1. Grab input devices via rdev::grab (evdev grab) so events can be suppressed
+//!    before they reach the X Server.
+//! 2. rdev reports positions from its OWN internal accumulator, driven by raw
+//!    evdev relative movements and clamped to the screen. XTest warps
+//!    (rdev::simulate) do NOT go through evdev, so the accumulator never
+//!    reflects warps. Therefore deltas MUST be computed from consecutive
+//!    reported positions only, and no cursor warping is needed (or valid).
+//! 3. Local mode: events pass through. When the logical cursor crosses the
+//!    right edge, enter remote mode and notify the client (BoundaryEnter).
+//! 4. Remote mode: ALL events are suppressed, so the real cursor stays frozen
+//!    at the crossing point; deltas are forwarded to the client.
+//! 5. The client decides when to return (its own left edge) and sends
+//!    BoundaryLeave; the server then sets exit_remote to switch back.
 
 use rdev::EventType;
 use ss_core::protocol::Button;
@@ -21,7 +24,7 @@ use tokio::sync::mpsc;
 /// A captured input event, before conversion to protocol message.
 #[derive(Debug, Clone)]
 pub enum WarpInputEvent {
-    /// Mouse delta calculated from cursor warping
+    /// Mouse delta calculated from consecutive reported positions
     MouseDelta { dx: f32, dy: f32 },
     /// Mouse button press/release
     MouseButton { button: Button, pressed: bool },
@@ -35,7 +38,7 @@ pub enum WarpInputEvent {
 
 /// Handle to the warp capture system.
 pub struct WarpCaptureHandle {
-    /// Receiver for captured input events.
+    /// Receiver for captured input events (with deltas).
     pub event_rx: mpsc::Receiver<WarpInputEvent>,
     /// Screen width for boundary detection.
     pub screen_width: u32,
@@ -52,18 +55,29 @@ struct CallbackState {
     tx: mpsc::Sender<WarpInputEvent>,
     screen_width: f64,
     screen_height: f64,
-    /// Whether we're currently in a warp (to suppress the warp event itself)
-    is_warping: Arc<AtomicBool>,
-    /// Last known position (for delta calculation after warp)
-    last_x: Arc<Mutex<f64>>,
-    last_y: Arc<Mutex<f64>>,
+    /// Previous position reported by rdev (for delta extraction).
+    prev_x: f64,
+    prev_y: f64,
+    /// Whether prev_x/prev_y have been initialized from a real event.
+    prev_initialized: bool,
+    /// Logical cursor position on the server screen, maintained by applying
+    /// deltas ourselves. Stays in sync with the real cursor in local mode
+    /// (same deltas, same clamping); in remote mode the real cursor is frozen
+    /// at `frozen_*` while the logical position keeps tracking movement.
+    pos_x: f64,
+    pos_y: f64,
+    /// Logical position where the cursor was frozen when entering remote mode.
+    /// The real cursor does not move in remote mode (all events suppressed),
+    /// so on exit we restore pos to this point and everything is back in sync.
+    frozen_x: f64,
+    frozen_y: f64,
     /// Whether we're in remote mode (cursor on client screen)
     is_remote: Arc<AtomicBool>,
     /// External signal to exit remote mode.
     exit_remote: Arc<AtomicBool>,
 }
 
-/// Start capturing input events with cursor warping.
+/// Start capturing input events with delta-based boundary detection.
 ///
 /// Returns a handle with:
 /// - `event_rx`: receives captured input events (with deltas)
@@ -74,19 +88,20 @@ pub fn start_capture(
     screen_height: u32,
 ) -> anyhow::Result<WarpCaptureHandle> {
     let (tx, rx) = mpsc::channel::<WarpInputEvent>(256);
-    let is_warping = Arc::new(AtomicBool::new(false));
     let is_remote = Arc::new(AtomicBool::new(false));
     let exit_remote = Arc::new(AtomicBool::new(false));
-    let last_x = Arc::new(Mutex::new((screen_width / 2) as f64));
-    let last_y = Arc::new(Mutex::new((screen_height / 2) as f64));
 
     let state = CallbackState {
         tx: tx.clone(),
         screen_width: screen_width as f64,
         screen_height: screen_height as f64,
-        is_warping: is_warping.clone(),
-        last_x: last_x.clone(),
-        last_y: last_y.clone(),
+        prev_x: 0.0,
+        prev_y: 0.0,
+        prev_initialized: false,
+        pos_x: (screen_width / 2) as f64,
+        pos_y: (screen_height / 2) as f64,
+        frozen_x: 0.0,
+        frozen_y: 0.0,
         is_remote: is_remote.clone(),
         exit_remote: exit_remote.clone(),
     };
@@ -98,110 +113,89 @@ pub fn start_capture(
         let callback_state = state.clone();
 
         let callback = move |event: rdev::Event| -> Option<rdev::Event> {
-            let state = callback_state.lock().unwrap();
-
-            // Check if we're warping (suppress the warp event itself)
-            if state.is_warping.load(Ordering::Relaxed) {
-                return Some(event); // Pass through warp events
-            }
+            let mut state = callback_state.lock().unwrap();
 
             // Check for external signal to exit remote mode
             if state.exit_remote.load(Ordering::Relaxed) {
                 state.is_remote.store(false, Ordering::Relaxed);
                 state.exit_remote.store(false, Ordering::Relaxed);
-                tracing::debug!("Exiting remote mode via external signal");
+                // The real cursor was frozen at the crossing point the whole
+                // time we were in remote mode (all events suppressed), so
+                // restoring the logical position to the frozen point keeps it
+                // in sync with the real cursor.
+                state.pos_x = state.frozen_x;
+                state.pos_y = state.frozen_y;
+                tracing::info!(
+                    "Exiting remote mode, cursor restored to ({:.0}, {:.0})",
+                    state.frozen_x,
+                    state.frozen_y
+                );
             }
 
-            // In remote mode, suppress ALL events from reaching X Server
-            if state.is_remote.load(Ordering::Relaxed) {
-                match event.event_type {
-                    EventType::MouseMove { x, y } => {
-                        let mut last_x = state.last_x.lock().unwrap();
-                        let mut last_y = state.last_y.lock().unwrap();
+            let is_remote = state.is_remote.load(Ordering::Relaxed);
 
-                        // Calculate delta from last position
-                        let dx = x - *last_x;
-                        let dy = y - *last_y;
+            match event.event_type {
+                EventType::MouseMove { x, y } => {
+                    // Delta = difference between consecutive reported positions.
+                    // This is exact even when rdev's accumulator clamps at a
+                    // screen edge: clamping only drops overshoot, it never
+                    // invents movement, and reversal responds immediately.
+                    let (dx, dy) = if state.prev_initialized {
+                        (x - state.prev_x, y - state.prev_y)
+                    } else {
+                        state.prev_initialized = true;
+                        // Sync logical position with rdev's accumulator (which
+                        // rdev initialized from the real cursor position).
+                        state.pos_x = x;
+                        state.pos_y = y;
+                        (0.0, 0.0)
+                    };
+                    state.prev_x = x;
+                    state.prev_y = y;
 
-                        // ==============================================
-                        // Fix: Detect ALL four edges in remote mode
-                        // ALL edges warp silently - Client decides when to return!
-                        // ==============================================
-                        let hit_left = x <= 0.0;
-                        let hit_top = y <= 0.0;
-                        let hit_bottom = y >= state.screen_height - 1.0;
-                        let hit_right = x >= state.screen_width - 1.0;
+                    state.pos_x = (state.pos_x + dx).clamp(0.0, state.screen_width);
+                    state.pos_y = (state.pos_y + dy).clamp(0.0, state.screen_height);
 
-                        if hit_left || hit_top || hit_bottom || hit_right {
-                            // Calculate wrap-around position
-                            let new_y = if hit_top {
-                                state.screen_height - 2.0  // warp to just above bottom
-                            } else if hit_bottom {
-                                1.0  // warp to just below top
-                            } else {
-                                y  // Y direction unchanged
-                            };
-
-                            let new_x = if hit_left {
-                                state.screen_width - 2.0  // warp to just inside right edge
-                            } else if hit_right {
-                                state.screen_width / 2.0  // warp to horizontal center
-                            } else {
-                                x  // X direction unchanged
-                            };
-
-                            // Set warping flag to suppress the warp event itself
-                            state.is_warping.store(true, Ordering::Relaxed);
-
-                            // Warp cursor to the new position
-                            if let Err(e) = rdev::simulate(&EventType::MouseMove {
-                                x: new_x,
-                                y: new_y,
-                            }) {
-                                tracing::warn!("Failed to warp cursor in remote mode: {:?}", e);
-                            }
-
-                            // Update last position to the warped position
-                            *last_x = new_x;
-                            *last_y = new_y;
-
-                            // Clear warping flag after a small delay
-                            let is_warping = state.is_warping.clone();
-                            std::thread::spawn(move || {
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                                is_warping.store(false, Ordering::Relaxed);
-                            });
-
-                            // Send delta (use the original delta, NOT the warp delta!)
+                    if is_remote {
+                        // Forward the delta to the client (skip pure-noise zeros).
+                        if dx != 0.0 || dy != 0.0 {
                             let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
                                 dx: dx as f32,
                                 dy: dy as f32,
                             });
-
-                            tracing::debug!(
-                                "Remote mode warp: hit={}, pos=({:.0}, {:.0}) warp_to=({:.0}, {:.0})",
-                                if hit_left { "left" } else if hit_top { "top" }
-                                else if hit_bottom { "bottom" } else { "right" },
-                                x, y, new_x, new_y
-                            );
-
-                            // Suppress this event from X Server
-                            return None;
                         }
-
-                        // Normal movement in remote mode
-                        *last_x = x;
-                        *last_y = y;
-
-                        let _ = state.tx.try_send(WarpInputEvent::MouseDelta {
-                            dx: dx as f32,
-                            dy: dy as f32,
-                        });
-
-                        // Suppress event from X Server
+                        // Suppress: the real cursor stays frozen in remote mode.
                         return None;
                     }
-                    EventType::ButtonPress(btn) => {
+
+                    // Local mode: cross into remote mode at the right edge.
+                    if state.pos_x >= state.screen_width - 1.0 {
+                        state.is_remote.store(true, Ordering::Relaxed);
+                        state.frozen_x = state.pos_x;
+                        state.frozen_y = state.pos_y;
+
+                        // Tell the client to position its cursor just past its
+                        // left boundary zone (BOUNDARY_ZONE_PX + 1).
+                        let _ = state.tx.try_send(WarpInputEvent::BoundaryEnter {
+                            enter_x: 6.0,
+                            enter_y: state.pos_y as f32,
+                        });
+
+                        tracing::info!(
+                            "Entering remote mode at ({:.0}, {:.0})",
+                            state.pos_x,
+                            state.pos_y
+                        );
+
+                        // Suppress this event from X Server
+                        return None;
+                    }
+
+                    // Normal local movement - pass through to X Server
+                    Some(event)
+                }
+                EventType::ButtonPress(btn) => {
+                    if is_remote {
                         if let Some(button) = map_button(btn) {
                             let _ = state.tx.try_send(WarpInputEvent::MouseButton {
                                 button,
@@ -211,157 +205,51 @@ pub fn start_capture(
                         // Suppress event from X Server
                         return None;
                     }
-                    EventType::ButtonRelease(btn) => {
+                    // Local mode: button events belong to the local machine.
+                    // Do NOT emit them to the forwarding channel — the only
+                    // consumer forwards everything it receives to clients.
+                    Some(event)
+                }
+                EventType::ButtonRelease(btn) => {
+                    if is_remote {
                         if let Some(button) = map_button(btn) {
                             let _ = state.tx.try_send(WarpInputEvent::MouseButton {
                                 button,
                                 pressed: false,
                             });
                         }
-                        // Suppress event from X Server
                         return None;
                     }
-                    EventType::Wheel { delta_x, delta_y } => {
+                    Some(event)
+                }
+                EventType::Wheel { delta_x, delta_y } => {
+                    if is_remote {
                         let _ = state.tx.try_send(WarpInputEvent::Scroll {
                             dx: delta_x as f32,
                             dy: delta_y as f32,
                         });
-                        // Suppress event from X Server
                         return None;
                     }
-                    EventType::KeyPress(key) => {
-                        let _ = state.tx.try_send(WarpInputEvent::KeyPress {
-                            keycode: key_to_u32(key),
-                            pressed: true,
-                        });
-                        // Suppress event from X Server
-                        return None;
-                    }
-                    EventType::KeyRelease(key) => {
-                        let _ = state.tx.try_send(WarpInputEvent::KeyPress {
-                            keycode: key_to_u32(key),
-                            pressed: false,
-                        });
-                        // Suppress event from X Server
-                        return None;
-                    }
-                }
-            }
-
-            // Local mode - process events normally
-            match event.event_type {
-                EventType::MouseMove { x, y } => {
-                    let mut last_x = state.last_x.lock().unwrap();
-                    let mut last_y = state.last_y.lock().unwrap();
-
-                    // Calculate delta from last position
-                    let _dx = x - *last_x;
-                    let _dy = y - *last_y;
-
-                    // Check if cursor hit right edge
-                    if x >= state.screen_width - 1.0 {
-                        // Warp cursor to center
-                        let center_x = state.screen_width / 2.0;
-                        let center_y = state.screen_height / 2.0;
-
-                        // ==============================================
-                        // Fix: Set is_remote FIRST, send BoundaryEnter FIRST
-                        // Do NOT send edge_dx delta - BoundaryEnter sets the correct position
-                        // ==============================================
-
-                        // Mark as remote FIRST (before any event sending)
-                        state.is_remote.store(true, Ordering::Relaxed);
-
-                        // Send BoundaryEnter FIRST - this tells the client to position
-                        // the cursor at the left edge
-                        let _ = state.tx.try_send(WarpInputEvent::BoundaryEnter {
-                            enter_x: 6.0,  // BOUNDARY_ZONE_PX + 1
-                            enter_y: y as f32,
-                        });
-
-                        // Set warping flag to suppress the warp event
-                        state.is_warping.store(true, Ordering::Relaxed);
-
-                        // Warp cursor to center
-                        if let Err(e) = rdev::simulate(&EventType::MouseMove {
-                            x: center_x,
-                            y: center_y,
-                        }) {
-                            tracing::warn!("Failed to warp cursor: {:?}", e);
-                        }
-
-                        // Update last position to center
-                        *last_x = center_x;
-                        *last_y = center_y;
-
-                        // Clear warping flag after a small delay
-                        let is_warping = state.is_warping.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                            is_warping.store(false, Ordering::Relaxed);
-                        });
-
-                        // Note: Do NOT send edge_dx MouseDelta!
-                        // BoundaryEnter already sets the correct initial position.
-                        // Sending delta would cause double-movement.
-
-                        tracing::debug!(
-                            "Cursor warped into remote mode: edge=({x:.0}, {y:.0}) center=({center_x:.0}, {center_y:.0})"
-                        );
-
-                        // Suppress this event from X Server
-                        return None;
-                    }
-
-                    // Normal movement - update last position
-                    *last_x = x;
-                    *last_y = y;
-
-                    // Pass through to X Server
-                    Some(event)
-                }
-                EventType::ButtonPress(btn) => {
-                    if let Some(button) = map_button(btn) {
-                        let _ = state.tx.try_send(WarpInputEvent::MouseButton {
-                            button,
-                            pressed: true,
-                        });
-                    }
-                    // Pass through to X Server
-                    Some(event)
-                }
-                EventType::ButtonRelease(btn) => {
-                    if let Some(button) = map_button(btn) {
-                        let _ = state.tx.try_send(WarpInputEvent::MouseButton {
-                            button,
-                            pressed: false,
-                        });
-                    }
-                    // Pass through to X Server
-                    Some(event)
-                }
-                EventType::Wheel { delta_x, delta_y } => {
-                    let _ = state.tx.try_send(WarpInputEvent::Scroll {
-                        dx: delta_x as f32,
-                        dy: delta_y as f32,
-                    });
-                    // Pass through to X Server
                     Some(event)
                 }
                 EventType::KeyPress(key) => {
-                    let _ = state.tx.try_send(WarpInputEvent::KeyPress {
-                        keycode: key_to_u32(key),
-                        pressed: true,
-                    });
-                    // Pass through to X Server
+                    if is_remote {
+                        let _ = state.tx.try_send(WarpInputEvent::KeyPress {
+                            keycode: key_to_u32(key),
+                            pressed: true,
+                        });
+                        return None;
+                    }
                     Some(event)
                 }
                 EventType::KeyRelease(key) => {
-                    let _ = state.tx.try_send(WarpInputEvent::KeyPress {
-                        keycode: key_to_u32(key),
-                        pressed: false,
-                    });
-                    // Pass through to X Server
+                    if is_remote {
+                        let _ = state.tx.try_send(WarpInputEvent::KeyPress {
+                            keycode: key_to_u32(key),
+                            pressed: false,
+                        });
+                        return None;
+                    }
                     Some(event)
                 }
             }
@@ -373,7 +261,7 @@ pub fn start_capture(
     });
 
     tracing::info!(
-        "Started warp capture (screen: {screen_width}x{screen_height})"
+        "Started input capture (screen: {screen_width}x{screen_height})"
     );
 
     Ok(WarpCaptureHandle {

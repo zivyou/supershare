@@ -215,6 +215,7 @@ async fn command_handler(
 
                 // Task: process warp input events (boundary-aware, delta-based)
                 let server_state_input = server_state.clone();
+                let is_remote = warp_capture.is_remote.clone();
                 let mut move_count: u64 = 0;
                 tokio::spawn(async move {
                     while let Some(event) = input_rx.recv().await {
@@ -236,22 +237,6 @@ async fn command_handler(
                             ss_input::warp_capture::WarpInputEvent::MouseDelta { dx, dy } => {
                                 move_count += 1;
 
-                                // Check for special return signal
-                                if *dx == -1.0 && *dy == 0.0 {
-                                    tracing::info!("*** BOUNDARY RETURN: cursor returned to local screen ***");
-
-                                    // Send BoundaryLeave to client
-                                    let clients = server_state_input.clients.read().await;
-                                    for (name, client) in clients.iter() {
-                                        if let Err(e) = client.control_tx.send(Message::BoundaryLeave {
-                                            source_screen: 1,
-                                        }).await {
-                                            tracing::error!("Failed to send BoundaryLeave to {name}: {e}");
-                                        }
-                                    }
-                                    continue;
-                                }
-
                                 if move_count % 200 == 0 {
                                     tracing::debug!("Mouse delta: ({dx:.0}, {dy:.0})");
                                 }
@@ -268,6 +253,11 @@ async fn command_handler(
                             ss_input::warp_capture::WarpInputEvent::MouseButton { .. }
                             | ss_input::warp_capture::WarpInputEvent::KeyPress { .. }
                             | ss_input::warp_capture::WarpInputEvent::Scroll { .. } => {
+                                // Only forward while the cursor is on a client screen.
+                                // Local clicks/keys/scroll must stay local.
+                                if !is_remote.load(std::sync::atomic::Ordering::Relaxed) {
+                                    continue;
+                                }
                                 // Forward other events to client
                                 let msg = ss_input::warp_capture::to_message(&event);
                                 let clients = server_state_input.clients.read().await;
@@ -291,10 +281,9 @@ async fn command_handler(
                         match broadcast_rx.recv().await {
                             Ok((client_name, msg)) => {
                                 match &msg {
-                                    // ==============================================
-                                    // Fix: Handle boundary return request from client
-                                    // ==============================================
-                                    Message::MouseDelta { dx: -3.0, dy: 0.0 } => {
+                                    // Boundary return request from client: the client's
+                                    // cursor hit its left edge, so switch back to local mode.
+                                    Message::BoundaryLeave { .. } => {
                                         tracing::info!("*** BOUNDARY RETURN REQUEST from {client_name} ***");
                                         // Signal warp_capture to exit remote mode
                                         exit_remote_signal.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -307,10 +296,6 @@ async fn command_handler(
                                     | Message::MouseScroll { .. }
                                     | Message::KeyPress { .. } => {
                                         tracing::debug!("Received input event from {client_name} (ignored in new architecture)");
-                                    }
-                                    // Boundary events from client: no longer expected
-                                    Message::BoundaryLeave { .. } => {
-                                        tracing::debug!("Received BoundaryLeave from {client_name} (ignored, server handles boundaries)");
                                     }
                                     // Clipboard messages from client
                                     Message::ClipboardData { .. }
@@ -708,8 +693,7 @@ fn spawn_client_connection(
                                                     // ==============================================
                                                     if hit_left {
                                                         tracing::info!("*** CLIENT LEFT BOUNDARY: sending return signal ***");
-                                                        // Send special delta = -3.0 to signal return request
-                                                        let return_msg = Message::MouseDelta { dx: -3.0, dy: 0.0 };
+                                                        let return_msg = Message::BoundaryLeave { source_screen: 1 };
                                                         if let Err(e) = data_tx_inject.send(return_msg).await {
                                                             tracing::warn!("Failed to send boundary return request: {e}");
                                                         }
@@ -1190,7 +1174,7 @@ async fn run_headless_client(
                             // If hit left edge, request return to Server
                             if hit_left {
                                 tracing::info!("*** CLIENT LEFT BOUNDARY: sending return signal ***");
-                                let return_msg = Message::MouseDelta { dx: -3.0, dy: 0.0 };
+                                let return_msg = Message::BoundaryLeave { source_screen: 1 };
                                 if let Err(e) = data_tx_inject.send(return_msg).await {
                                     tracing::warn!("Failed to send boundary return request: {e}");
                                 }
